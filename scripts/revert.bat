@@ -1,0 +1,1 @@
+".\dispwin.exe" -c
