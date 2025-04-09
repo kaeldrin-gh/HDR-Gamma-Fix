@@ -1,0 +1,48 @@
+## .NET build outputs
+bin/
+obj/
+
+## Visual Studio files
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.userprefs
+*.vspscc
+*.vssscc
+.vscode/
+*.code-workspace
+
+## Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+msbuild.log
+msbuild.err
+msbuild.wrn
+
+## NuGet
+*.nupkg
+*.nuget.props
+*.nuget.targets
+packages/
+
+## Publish output
+publish/
+
+## Local history
+.localhistory/
+
+## Temporary files
+*.tmp
+*.log
+*.bak

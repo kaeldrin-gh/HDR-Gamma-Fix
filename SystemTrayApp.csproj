@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <StartupObject>SystemTrayApp.Program</StartupObject>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    
+    <!-- Application Name Properties -->
+    <AssemblyName>HDRGammaFix</AssemblyName>
+    <Product>HDR Gamma Fix</Product>
+    <Title>HDR Gamma Fix</Title>
+    <Description>Utility to fix gamma issues when using HDR</Description>
+    
+    <!-- Set the application icon -->
+    <ApplicationIcon>Resources\GammaIcon.ico</ApplicationIcon>
+  </PropertyGroup>
+  
+  <!-- For regular debugging/development -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <!-- No special settings for debug builds -->
+  </PropertyGroup>
+  
+  <!-- For release builds -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained> 
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="scripts\*.bat">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="scripts\dispwin.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="scripts\lut.cal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- Add your icon files -->
+    <Content Include="Resources\DefaultIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Resources\GammaIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
