@@ -42,18 +42,6 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 - Use **Alt+F2** to revert to the default Windows profile
 - **Right-click** for additional options including startup configuration
 
-## Building from Source
-
-### Prerequisites
-- Visual Studio 2022 or newer
-- .NET 9 SDK
-
-### Steps
-1. Clone this repository
-2. Open SystemTrayApp.sln in Visual Studio
-3. Build the solution
-4. The compiled output will be in the `bin\Release\net9.0-windows\publish` folder
-
 ## License
 
 MIT License - See [LICENSE](LICENSE) file for details.
