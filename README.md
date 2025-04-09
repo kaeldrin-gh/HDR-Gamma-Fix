@@ -15,7 +15,7 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 
 ## Features
 
-- **Quick Toggle:** Left-click the tray icon to switch between default and gamma-corrected profiles
+- **Quick Toggle:** Single left-click the tray icon to switch between default and gamma-corrected profiles
 - **Keyboard Shortcuts:**
   - Alt+F1: Apply sRGB to Gamma profile
   - Alt+F2: Revert to Default profile
