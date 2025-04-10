@@ -34,14 +34,19 @@ namespace SystemTrayApp
         // Message handler form for hotkeys
         private HotkeyMessageHandler _messageHandler;
 
+        // --- Notification Debouncing ---
+        private System.Windows.Forms.Timer _notificationTimer;
+        private const int NotificationDelayMilliseconds = 500; // Delay before showing notification (adjust as needed)
+        private (string Title, string Message, ToolTipIcon Icon)? _pendingNotificationDetails = null; // Tuple to hold pending details
+
         public TrayApplicationContext()
         {
             InitializeComponent(); // Initialize UI elements first
             RegisterHotkeys();     // Register hotkeys
+            InitializeNotificationTimer(); // Initialize the notification timer
 
-            // *** Add this line to apply the profile on startup ***
+            // Apply the profile on startup (notification will be queued)
             ApplySrgbToGamma();
-            // *****************************************************
         }
 
         private void InitializeComponent()
@@ -70,7 +75,6 @@ namespace SystemTrayApp
             LoadIcons();
 
             // Create the tray icon with the default icon
-            // Note: The icon will be updated immediately by ApplySrgbToGamma if successful
             _notifyIcon = new NotifyIcon
             {
                 Icon = _defaultIcon, // Start with default, will be updated
@@ -89,24 +93,87 @@ namespace SystemTrayApp
             };
         }
 
+        // --- Initialize Notification Timer ---
+        private void InitializeNotificationTimer()
+        {
+            _notificationTimer = new System.Windows.Forms.Timer
+            {
+                Interval = NotificationDelayMilliseconds
+            };
+            _notificationTimer.Tick += NotificationTimer_Tick;
+        }
+
+        // --- Timer Tick Event Handler ---
+        private void NotificationTimer_Tick(object sender, EventArgs e)
+        {
+            _notificationTimer.Stop(); // Stop the timer
+
+            // If there are pending details, show the notification now
+            if (_pendingNotificationDetails.HasValue)
+            {
+                var details = _pendingNotificationDetails.Value;
+                ShowBalloonTipInternal(details.Title, details.Message, details.Icon); // Call the internal method
+                _pendingNotificationDetails = null; // Clear pending details
+            }
+        }
+
+        // --- Queue Notification Method ---
+        /// <summary>
+        /// Queues a notification to be shown after a short delay.
+        /// If another notification is queued before the delay expires, only the latest one will be shown.
+        /// </summary>
+        private void QueueBalloonTip(string title, string message, ToolTipIcon icon)
+        {
+            // Store the details of the notification to be shown
+            _pendingNotificationDetails = (title, message, icon);
+
+            // Stop the timer if it's already running (resets the delay)
+            _notificationTimer.Stop();
+            // Start the timer (again)
+            _notificationTimer.Start();
+        }
+
+        // --- Internal Method to Show Balloon Tip Immediately ---
+        /// <summary>
+        /// Shows the balloon tip immediately. Use QueueBalloonTip for debounced notifications.
+        /// </summary>
+        private void ShowBalloonTipInternal(string title, string message, ToolTipIcon icon)
+        {
+            // Ensure notify icon exists and is visible before showing tip
+            if (_notifyIcon == null || !_notifyIcon.Visible) return;
+
+            // Cancel any existing notification by briefly hiding and showing
+            // This is a common workaround for notification update issues
+            _notifyIcon.Visible = false;
+            _notifyIcon.Visible = true;
+
+            // Set notification properties
+            _notifyIcon.BalloonTipTitle = title;
+            _notifyIcon.BalloonTipText = message;
+            _notifyIcon.BalloonTipIcon = icon;
+
+            // Show for a standard duration
+            _notifyIcon.ShowBalloonTip(1500); // Adjusted duration
+        }
+
+
         private void RegisterHotkeys()
         {
-            // Create a message handler form to receive hotkey messages
             _messageHandler = new HotkeyMessageHandler();
             _messageHandler.HotkeyPressed += OnHotkeyPressed;
 
-            // Register Alt+F1 for Gamma profile
             if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, MOD_ALT, VK_F1))
             {
-                ShowBalloonTip("Hotkey Registration Failed",
+                // Use the queue method for errors too
+                QueueBalloonTip("Hotkey Registration Failed",
                               "Could not register Alt+F1 hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
             }
 
-            // Register Alt+F2 for Default profile
             if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, MOD_ALT, VK_F2))
             {
-                ShowBalloonTip("Hotkey Registration Failed",
+                 // Use the queue method for errors too
+                QueueBalloonTip("Hotkey Registration Failed",
                               "Could not register Alt+F2 hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
             }
@@ -114,14 +181,13 @@ namespace SystemTrayApp
 
         private void UnregisterHotkeys()
         {
-            // Use null conditional operator ?. for safer access
             if (_messageHandler != null && !_messageHandler.IsDisposed)
             {
                 UnregisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA);
                 UnregisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT);
                 _messageHandler.HotkeyPressed -= OnHotkeyPressed;
                 _messageHandler.Dispose();
-                _messageHandler = null; // Set to null after disposal
+                _messageHandler = null;
             }
         }
 
@@ -141,11 +207,9 @@ namespace SystemTrayApp
 
         private void LoadIcons()
         {
-            // Default icon (for default profile)
             string defaultIconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "DefaultIcon.ico");
             string gammaIconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "GammaIcon.ico");
 
-            // Load default icon
             try
             {
                 _defaultIcon = File.Exists(defaultIconPath) ? new Icon(defaultIconPath) : SystemIcons.Application;
@@ -153,11 +217,9 @@ namespace SystemTrayApp
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error loading default icon: {ex.Message}");
-                _defaultIcon = SystemIcons.Application; // Fallback on error
+                _defaultIcon = SystemIcons.Application;
             }
 
-
-            // Load gamma icon
             try
             {
                  _gammaIcon = File.Exists(gammaIconPath) ? new Icon(gammaIconPath) : SystemIcons.Information;
@@ -165,46 +227,25 @@ namespace SystemTrayApp
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error loading gamma icon: {ex.Message}");
-                _gammaIcon = SystemIcons.Information; // Fallback on error
+                _gammaIcon = SystemIcons.Information;
             }
-        }
-
-        private void ShowBalloonTip(string title, string message, ToolTipIcon icon, bool briefNotification = false)
-        {
-            // Ensure notify icon exists and is visible before showing tip
-            if (_notifyIcon == null || !_notifyIcon.Visible) return;
-
-            // Cancel any existing notification by briefly hiding and showing
-            // This is a common workaround for notification update issues
-            _notifyIcon.Visible = false;
-            _notifyIcon.Visible = true;
-
-            // Set notification properties
-            _notifyIcon.BalloonTipTitle = title;
-            _notifyIcon.BalloonTipText = message;
-            _notifyIcon.BalloonTipIcon = icon;
-
-            // Show for very brief duration if briefNotification is true
-            _notifyIcon.ShowBalloonTip(briefNotification ? 500 : 2000);
         }
 
         private void ToggleProfile()
         {
             if (_isDefaultProfile)
             {
-                // Currently default, switch to gamma
                 ApplySrgbToGamma();
             }
             else
             {
-                // Currently gamma, switch to default
                 RevertToDefault();
             }
         }
 
         private void UpdateIcon()
         {
-            if (_notifyIcon == null) return; // Prevent NullReferenceException if called too early
+            if (_notifyIcon == null) return;
 
             _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon : _gammaIcon;
             _notifyIcon.Text = _isDefaultProfile ? "Color Profile: Default" : "Color Profile: sRGB to Gamma";
@@ -215,15 +256,13 @@ namespace SystemTrayApp
             if (ExecuteBatchFile("srgb-to-gamma.bat"))
             {
                 _isDefaultProfile = false;
-                UpdateIcon(); // Update icon and text
+                UpdateIcon();
 
-                // Show notification (only if not during initial startup maybe? Optional)
-                // Consider if you want this notification every single time it starts
-                ShowBalloonTip("Profile Changed",
+                // Queue the notification instead of showing immediately
+                QueueBalloonTip("Profile Changed",
                               "Applied sRGB to Gamma profile",
-                              ToolTipIcon.Info, true);
+                              ToolTipIcon.Info);
             }
-            // No else needed here, ExecuteBatchFile handles showing errors
         }
 
         private void RevertToDefault()
@@ -231,17 +270,15 @@ namespace SystemTrayApp
             if (ExecuteBatchFile("revert.bat"))
             {
                 _isDefaultProfile = true;
-                UpdateIcon(); // Update icon and text
+                UpdateIcon();
 
-                // Show notification
-                ShowBalloonTip("Profile Changed",
+                // Queue the notification instead of showing immediately
+                QueueBalloonTip("Profile Changed",
                               "Reverted to Default profile",
-                              ToolTipIcon.Info, true);
+                              ToolTipIcon.Info);
             }
-             // No else needed here, ExecuteBatchFile handles showing errors
         }
 
-        // Event handlers for menu items just call the main methods
         private void OnApplySrgbToGamma(object sender, EventArgs e) => ApplySrgbToGamma();
         private void OnRevertToDefault(object sender, EventArgs e) => RevertToDefault();
 
@@ -251,16 +288,13 @@ namespace SystemTrayApp
             string foundPath = null;
             try
             {
-                // Define potential locations relative to the application's base directory
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 string[] possibleRelativePaths = new string[]
                 {
-                    fileName,             // Direct in application directory
-                    Path.Combine("scripts", fileName) // In scripts subdirectory
-                    // Add more relative paths here if needed
+                    fileName,
+                    Path.Combine("scripts", fileName)
                 };
 
-                // Find the first existing file path
                 foundPath = possibleRelativePaths
                                 .Select(relativePath => Path.Combine(baseDir, relativePath))
                                 .FirstOrDefault(File.Exists);
@@ -272,24 +306,20 @@ namespace SystemTrayApp
                     string errorMsg = $"Could not find '{fileName}'. Tried the following locations:{Environment.NewLine}  - {attemptedPaths}";
 
                     MessageBox.Show(errorMsg, "File Not Found", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    ShowBalloonTip("Error", $"Could not find {fileName}", ToolTipIcon.Error);
+                    // Use QueueBalloonTip for consistency, even for errors shown via MessageBox
+                    QueueBalloonTip("Error", $"Could not find {fileName}", ToolTipIcon.Error);
                     return false;
                 }
 
-                // Get the directory where the batch file is located
                 string workingDirectory = Path.GetDirectoryName(foundPath) ?? baseDir;
 
-                // Launch a command prompt and execute the batch file
-                // UseShellExecute = true allows running batch files directly without cmd.exe /c
-                // CreateNoWindow = true hides the command prompt window
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    FileName = foundPath, // Execute the batch file directly
-                    // Arguments = $"/c \"{foundPath}\"", // Not needed if FileName is the .bat and UseShellExecute=true
-                    UseShellExecute = true, // Important for running .bat files easily
-                    CreateNoWindow = true, // Hide the cmd window
-                    WindowStyle = ProcessWindowStyle.Hidden, // Reinforce hiding
-                    WorkingDirectory = workingDirectory  // Set the working directory
+                    FileName = foundPath,
+                    UseShellExecute = true,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    WorkingDirectory = workingDirectory
                 };
 
                 using (Process process = Process.Start(psi))
@@ -298,25 +328,22 @@ namespace SystemTrayApp
                     {
                         string errorMsg = $"Failed to start process for '{fileName}'.";
                         MessageBox.Show(errorMsg, "Execution Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        ShowBalloonTip("Error", $"Failed to execute {fileName}", ToolTipIcon.Error);
+                        QueueBalloonTip("Error", $"Failed to execute {fileName}", ToolTipIcon.Error);
                         return false;
                     }
-                    // Optional: Wait for the process to exit if needed, though likely not for this use case
-                    // process.WaitForExit();
                 }
 
-                return true; // Assume success if process started without immediate error
+                return true;
             }
             catch (Exception ex)
             {
                 string errorMsg = $"Error executing '{fileName}': {ex.Message}";
-                // Include foundPath in error if available
                 if (!string.IsNullOrEmpty(foundPath)) {
                     errorMsg += $"\nPath: {foundPath}";
                 }
                 MessageBox.Show(errorMsg, "Execution Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                ShowBalloonTip("Error", $"Error executing {fileName}", ToolTipIcon.Error); // Keep balloon tip concise
-                Debug.WriteLine($"Execution Error: {errorMsg}\n{ex.StackTrace}"); // Log more details for debugging
+                QueueBalloonTip("Error", $"Error executing {fileName}", ToolTipIcon.Error);
+                Debug.WriteLine($"Execution Error: {errorMsg}\n{ex.StackTrace}");
                 return false;
             }
         }
@@ -324,16 +351,11 @@ namespace SystemTrayApp
 
         private void OnExit(object sender, EventArgs e)
         {
-            // Hide tray icon before exiting to avoid it lingering
             if (_notifyIcon != null)
             {
                  _notifyIcon.Visible = false;
             }
-
-            // Unregister hotkeys cleanly
             UnregisterHotkeys();
-
-            // Request application exit
             Application.Exit();
         }
 
@@ -342,19 +364,20 @@ namespace SystemTrayApp
             if (disposing)
             {
                 // Dispose managed resources
+                _notificationTimer?.Stop(); // Stop the timer before disposing
+                _notificationTimer?.Dispose();
                 _defaultIcon?.Dispose();
                 _gammaIcon?.Dispose();
                 _notifyIcon?.Dispose();
-                _contextMenu?.Dispose(); // Dispose context menu too
-                UnregisterHotkeys(); // Ensure hotkeys are unregistered if not already done by OnExit
-                 _messageHandler?.Dispose(); // Ensure message handler is disposed
+                _contextMenu?.Dispose();
+                UnregisterHotkeys(); // Ensure hotkeys are unregistered
+                 _messageHandler?.Dispose();
             }
-
             base.Dispose(disposing);
         }
 
         // --- Startup Configuration ---
-        private const string AppRegistryName = "HDRGammaFix"; // Use a constant for the name
+        private const string AppRegistryName = "HDRGammaFix";
 
         private void SetStartup(bool enable)
         {
@@ -362,37 +385,37 @@ namespace SystemTrayApp
             {
                 string appPath = Application.ExecutablePath;
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true)) // Use @ for verbatim string
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
                 {
                     if (key == null)
                     {
-                         ShowBalloonTip("Registry Error", "Could not open startup registry key.", ToolTipIcon.Error);
-                         return; // Exit if key cannot be opened
+                         QueueBalloonTip("Registry Error", "Could not open startup registry key.", ToolTipIcon.Error);
+                         return;
                     }
 
                     if (enable)
                     {
-                        key.SetValue(AppRegistryName, $"\"{appPath}\""); // Quote the path just in case
-                        ShowBalloonTip("Startup Setting Changed",
+                        key.SetValue(AppRegistryName, $"\"{appPath}\"");
+                        QueueBalloonTip("Startup Setting Changed",
                                       "Application will now run at Windows startup.",
                                       ToolTipIcon.Info);
                     }
                     else
                     {
-                        // Check if the value exists before trying to delete
                         if (key.GetValue(AppRegistryName) != null)
                         {
-                            key.DeleteValue(AppRegistryName, false); // false = do not throw if not found
-                            ShowBalloonTip("Startup Setting Changed",
+                            key.DeleteValue(AppRegistryName, false);
+                            QueueBalloonTip("Startup Setting Changed",
                                           "Application will no longer run at Windows startup.",
                                           ToolTipIcon.Info);
                         }
+                        // Optional: Show a notification even if it wasn't set? Probably not needed.
                     }
                 }
             }
             catch (Exception ex)
             {
-                 ShowBalloonTip("Registry Error", $"Failed to update startup setting: {ex.Message}", ToolTipIcon.Error);
+                 QueueBalloonTip("Registry Error", $"Failed to update startup setting: {ex.Message}", ToolTipIcon.Error);
                  Debug.WriteLine($"Registry Error: {ex.Message}\n{ex.StackTrace}");
             }
         }
@@ -402,80 +425,64 @@ namespace SystemTrayApp
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false)) // Open for read-only
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false))
                 {
-                    // Check if key exists and the value exists
                     return key?.GetValue(AppRegistryName) != null;
                 }
             }
              catch (Exception ex)
             {
-                 // Log the error, but return false as we can't confirm it's configured
                  Debug.WriteLine($"Error checking startup registry: {ex.Message}");
                  return false;
             }
         }
     }
 
-    // This invisible form is used to receive global hotkey messages
+    // HotkeyMessageHandler class remains the same as before
     public class HotkeyMessageHandler : Form
     {
         private const int WM_HOTKEY = 0x0312;
 
-        public event Action<int> HotkeyPressed; // Non-nullable delegate type
+        public event Action<int> HotkeyPressed;
 
         public HotkeyMessageHandler()
         {
-            // Create a minimal, invisible window
-            this.CreateHandle(); // Ensure the handle is created
+            this.CreateHandle();
         }
 
         protected override CreateParams CreateParams
         {
             get
             {
-                // Hide the window effectively
                 var cp = base.CreateParams;
                 cp.ExStyle |= 0x80; // WS_EX_TOOLWINDOW
-                cp.Style = 0; // No border or caption
+                cp.Style = 0;
                 cp.Width = 0;
                 cp.Height = 0;
-                cp.X = -2000; // Position off-screen
+                cp.X = -2000;
                 cp.Y = -2000;
-                // Ensure it's a message-only window if possible, though CreateHandle approach is common
-                // cp.Parent = (IntPtr)(-3); // HWND_MESSAGE
                 return cp;
             }
         }
 
-
         protected override void SetVisibleCore(bool value)
         {
-             // Prevent the window from ever becoming visible
             base.SetVisibleCore(false);
         }
 
-
         protected override void WndProc(ref Message m)
         {
-            // Listen for the hotkey message
             if (m.Msg == WM_HOTKEY)
             {
                 int hotkeyId = m.WParam.ToInt32();
-                // Safely invoke the event
                 HotkeyPressed?.Invoke(hotkeyId);
             }
-
             base.WndProc(ref m);
         }
 
-        // Override Dispose to ensure cleanup if needed, though base Dispose should handle handle release
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
-            {
-                 // Dispose managed resources if any were added
-            }
+            // No specific managed resources added here in this example
             base.Dispose(disposing);
         }
     }
