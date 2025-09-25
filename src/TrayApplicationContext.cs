@@ -41,9 +41,9 @@ namespace SystemTrayApp
 
         public TrayApplicationContext()
         {
-            InitializeComponent(); // Initialize UI elements first
+            InitializeNotificationTimer(); // Initialize the notification timer first
+            InitializeComponent(); // Initialize UI elements
             RegisterHotkeys();     // Register hotkeys
-            InitializeNotificationTimer(); // Initialize the notification timer
 
             // Apply the profile on startup (notification will be queued)
             ApplySrgbToGamma();
@@ -124,6 +124,10 @@ namespace SystemTrayApp
         /// </summary>
         private void QueueBalloonTip(string title, string message, ToolTipIcon icon)
         {
+            // Safety check - if timer is not initialized yet, skip notification
+            if (_notificationTimer == null)
+                return;
+                
             // Store the details of the notification to be shown
             _pendingNotificationDetails = (title, message, icon);
 
@@ -164,7 +168,7 @@ namespace SystemTrayApp
 
             if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, MOD_ALT, VK_F1))
             {
-                // Use the queue method for errors too
+                // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
                               "Could not register Alt+F1 hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
@@ -172,7 +176,7 @@ namespace SystemTrayApp
 
             if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, MOD_ALT, VK_F2))
             {
-                 // Use the queue method for errors too
+                 // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
                               "Could not register Alt+F2 hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
