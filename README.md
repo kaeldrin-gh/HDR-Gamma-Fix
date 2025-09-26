@@ -8,6 +8,8 @@ Windows HDR implementation often causes SDR content to appear washed out due to 
 
 This tool is designed to stay in your system tray, allowing you to quickly switch profiles with keyboard shortcuts or by clicking the tray icon.
 
+![HDR Gamma Fix Interface](ui.png)
+
 **Based on:** [win11hdr-srgb-to-gamma2.2-icm](https://github.com/dylanraga/win11hdr-srgb-to-gamma2.2-icm) by dylanraga. This project provides a convenient interface for applying the color calibration approach described in that repository. The brightness values can be adjusted to suit your monitor's needs by modifying the 'lut.cal' file in the scripts folder. Refer to the guide in dylanraga's repository for detailed instructions.
 
 ### Current Configuration
