@@ -1,6 +1,6 @@
 # HDR Gamma Fix
 
-A Windows system tray utility to fix gamma issues with SDR content when using HDR.
+A Windows system tray utility to fix gamma issues with SDR content when using HDR displays with comprehensive multi-monitor support.
 
 ## Overview
 
@@ -15,13 +15,34 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 
 ## Features
 
+### Core Functionality
 - **Quick Toggle:** Single left-click the tray icon to switch between default and gamma-corrected profiles
 - **Keyboard Shortcuts:**
   - Alt+F1: Apply sRGB to Gamma profile
   - Alt+F2: Revert to Default profile
 - **Minimal Footprint:** Lightweight system tray application that uses minimal resources
-- **Startup Option:** Configure the application to run automatically at Windows startup
 - **Visual Feedback:** Different icons for each profile state and brief notifications
+
+### Multi-Monitor Support
+- **Automatic Monitor Detection:** Detects all available monitors using dispwin.exe
+- **Selective Application:** Choose to apply profiles to specific monitors or all monitors
+- **Monitor-Specific Control:** Apply different profiles to different monitors as needed
+- **Smart Menu Display:** Context menu shows all available monitors with clear labels
+
+### User Experience
+- **Notification Control:** Toggle balloon notifications on/off while retaining all functionality
+- **Startup Management:** Configure the application to run automatically at Windows startup
+- **Settings Persistence:** All preferences (monitor selection, notification settings) are saved and restored
+- **Visual Status:** Tray icon tooltip shows current profile and selected monitor(s)
+
+### Menu Options
+- Apply sRGB to Gamma (Alt+F1)
+- Revert to Default (Alt+F2)
+- Run at Startup (toggleable)
+- Apply to Monitor (submenu with all detected monitors)
+  - All Monitors (applies to every detected monitor)
+  - Individual monitor selection (Monitor 1, Monitor 2, etc.)
+- Show Notifications (toggleable)
 
 ## Requirements
 
@@ -31,16 +52,55 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 ## Installation
 
 1. Download the latest release from the [Releases](../../releases) page
-2. Extract the files to a location of your choice
+2. Extract the files to a location of your choice (ensure all files stay together)
 3. Run HDRGammaFix.exe
 4. Optionally, enable "Run at Startup" from the context menu
 
+### Required Files for Distribution
+When moving or sharing the application, ensure these files stay together:
+- HDRGammaFix.exe
+- HDRGammaFix.dll
+- HDRGammaFix.deps.json
+- HDRGammaFix.runtimeconfig.json
+- scripts/dispwin.exe
+- scripts/lut.cal
+- scripts/srgb-to-gamma.bat
+- scripts/revert.bat
+- Resources/DefaultIcon.ico
+- Resources/GammaIcon.ico
+
 ## Usage
 
+### Basic Operation
 - **Left-click** the tray icon to toggle between profiles
 - Use **Alt+F1** to apply the gamma-corrected profile
 - Use **Alt+F2** to revert to the default Windows profile
-- **Right-click** for additional options including startup configuration
+- **Right-click** for additional options and settings
+
+### Multi-Monitor Setup
+1. Right-click the tray icon to open the context menu
+2. Navigate to "Apply to Monitor" submenu
+3. Select either:
+   - **All Monitors**: Applies the profile to every detected monitor
+   - **Individual Monitor**: Choose a specific monitor (e.g., Monitor 1, Monitor 2)
+4. The selected option is remembered between application restarts
+
+### Notifications
+- Toggle balloon notifications on/off via "Show Notifications" in the context menu
+- When enabled, you'll see brief notifications when profiles are applied
+- When disabled, the application works silently while maintaining all functionality
+
+## Troubleshooting
+
+### Monitor Detection Issues
+- Ensure dispwin.exe is in the scripts folder
+- Try restarting the application to refresh monitor detection
+- Check that all monitors are properly connected and recognized by Windows
+
+### Profile Not Applied
+- Verify all required files are present in the application folder
+- Ensure HDR is enabled in Windows Display Settings for the target monitor
+- Try applying to individual monitors if "All Monitors" isn't working
 
 ## License
 

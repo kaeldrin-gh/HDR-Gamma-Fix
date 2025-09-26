@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -6,6 +7,7 @@ using System.Windows.Forms;
 using System.Runtime.InteropServices;
 using Microsoft.Win32; // Added for Registry access clarity
 using System.Drawing; // Added for Icon/SystemIcons clarity
+using System.Text.RegularExpressions; // Added for monitor detection parsing
 
 namespace SystemTrayApp
 {
@@ -39,9 +41,34 @@ namespace SystemTrayApp
         private const int NotificationDelayMilliseconds = 500; // Delay before showing notification (adjust as needed)
         private (string Title, string Message, ToolTipIcon Icon)? _pendingNotificationDetails = null; // Tuple to hold pending details
 
+        // --- Monitor Selection ---
+        private List<MonitorInfo> _availableMonitors = new List<MonitorInfo>();
+        private int _selectedMonitorIndex = -1; // -1 means all monitors, 0+ means specific monitor
+        
+        // --- Notification Settings ---
+        private bool _notificationsEnabled = true; // Default to enabled, loaded from registry
+        
+        // Monitor information structure
+        public struct MonitorInfo
+        {
+            public int DisplayNumber;
+            public string DisplayName;
+            public bool IsWorking;
+            
+            public MonitorInfo(int displayNumber, string displayName, bool isWorking)
+            {
+                DisplayNumber = displayNumber;
+                DisplayName = displayName;
+                IsWorking = isWorking;
+            }
+        }
+
         public TrayApplicationContext()
         {
             InitializeNotificationTimer(); // Initialize the notification timer first
+            DetectAvailableMonitors(); // Detect monitors
+            LoadMonitorSelection(); // Load user's monitor preference
+            LoadNotificationSetting(); // Load user's notification preference
             InitializeComponent(); // Initialize UI elements
             RegisterHotkeys();     // Register hotkeys
 
@@ -68,6 +95,20 @@ namespace SystemTrayApp
             };
             _contextMenu.Items.Add(startupItem);
 
+            _contextMenu.Items.Add(new ToolStripSeparator());
+            
+            // Add monitor selection submenu
+            AddMonitorSelectionMenu();
+            
+            // Add notification toggle option
+            var notificationItem = new ToolStripMenuItem("Show Notifications");
+            notificationItem.Checked = _notificationsEnabled;
+            notificationItem.Click += (s, e) => {
+                notificationItem.Checked = !notificationItem.Checked;
+                SaveNotificationSetting(notificationItem.Checked);
+            };
+            _contextMenu.Items.Add(notificationItem);
+            
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add("Exit", null, OnExit);
 
@@ -143,6 +184,9 @@ namespace SystemTrayApp
         /// </summary>
         private void ShowBalloonTipInternal(string title, string message, ToolTipIcon icon)
         {
+            // Check if notifications are enabled
+            if (!_notificationsEnabled) return;
+            
             // Ensure notify icon exists and is visible before showing tip
             if (_notifyIcon == null || !_notifyIcon.Visible) return;
 
@@ -158,6 +202,246 @@ namespace SystemTrayApp
 
             // Show for a standard duration
             _notifyIcon.ShowBalloonTip(1500); // Adjusted duration
+        }
+
+        // --- Monitor Detection and Management ---
+        private void DetectAvailableMonitors()
+        {
+            _availableMonitors.Clear();
+            
+            // Try to detect monitors using dispwin.exe help output
+            string dispwinPath = FindDispwinExecutable();
+            if (string.IsNullOrEmpty(dispwinPath))
+            {
+                // Fallback: assume at least one monitor
+                _availableMonitors.Add(new MonitorInfo(1, "Primary Monitor", true));
+                return;
+            }
+
+            // Parse dispwin help output to get actual monitor list
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = dispwinPath,
+                    Arguments = "-?", // Help command shows available displays
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                using Process process = Process.Start(psi);
+                if (process != null)
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string errorOutput = process.StandardError.ReadToEnd();
+                    process.WaitForExit(5000);
+                    
+                    // Parse both stdout and stderr for display information
+                    string fullOutput = output + errorOutput;
+                    ParseMonitorsFromDispwinOutput(fullOutput);
+                }
+            }
+            catch
+            {
+                // If parsing fails, fall back to single monitor
+            }
+            
+            // If no monitors detected, add primary as fallback
+            if (_availableMonitors.Count == 0)
+            {
+                _availableMonitors.Add(new MonitorInfo(1, "Primary Monitor", true));
+            }
+        }
+        
+        private void ParseMonitorsFromDispwinOutput(string output)
+        {
+            // Look for lines like: "    1 = 'DISPLAY1, at 0, 0, width 2560, height 1440 (Primary Display)'"
+            string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (string line in lines)
+            {
+                // Match lines that start with spaces, then a number, then " = '"
+                if (Regex.IsMatch(line.Trim(), @"^\d+\s*=\s*'.*'"))
+                {
+                    try
+                    {
+                        // Extract monitor number and description
+                        var match = Regex.Match(line.Trim(), @"^(\d+)\s*=\s*'([^']+)'");
+                        if (match.Success)
+                        {
+                            int monitorNum = int.Parse(match.Groups[1].Value);
+                            string description = match.Groups[2].Value;
+                            
+                            // Create a cleaner display name
+                            string displayName = $"Monitor {monitorNum}";
+                            if (description.Contains("Primary"))
+                                displayName += " (Primary)";
+                            
+                            _availableMonitors.Add(new MonitorInfo(monitorNum, displayName, true));
+                        }
+                    }
+                    catch
+                    {
+                        // Skip malformed lines
+                    }
+                }
+            }
+        }
+        
+        
+        private string FindDispwinExecutable()
+        {
+            string[] possiblePaths = new string[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scripts", "dispwin.exe"),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dispwin.exe"),
+            };
+            
+            return possiblePaths.FirstOrDefault(File.Exists) ?? "";
+        }
+        
+        private void LoadMonitorSelection()
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                    @"SOFTWARE\HDRGammaFix", false);
+                
+                if (key?.GetValue("SelectedMonitor") is int selectedMonitor)
+                {
+                    _selectedMonitorIndex = selectedMonitor;
+                }
+                else
+                {
+                    _selectedMonitorIndex = -1; // Default to all monitors
+                }
+            }
+            catch
+            {
+                _selectedMonitorIndex = -1; // Default to all monitors on error
+            }
+        }
+        
+        private void LoadNotificationSetting()
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                    @"SOFTWARE\HDRGammaFix", false);
+                
+                if (key?.GetValue("NotificationsEnabled") is int notificationValue)
+                {
+                    _notificationsEnabled = notificationValue != 0;
+                }
+                else
+                {
+                    _notificationsEnabled = true; // Default to enabled
+                }
+            }
+            catch
+            {
+                _notificationsEnabled = true; // Default to enabled on error
+            }
+        }
+        
+        private void SaveMonitorSelection(int monitorIndex)
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\HDRGammaFix");
+                key?.SetValue("SelectedMonitor", monitorIndex);
+                _selectedMonitorIndex = monitorIndex;
+            }
+            catch
+            {
+                // Ignore save errors
+            }
+        }
+        
+        private void SaveNotificationSetting(bool enabled)
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\HDRGammaFix");
+                key?.SetValue("NotificationsEnabled", enabled ? 1 : 0);
+                _notificationsEnabled = enabled;
+            }
+            catch
+            {
+                // Ignore save errors
+            }
+        }
+        
+        private void AddMonitorSelectionMenu()
+        {
+            if (_availableMonitors.Count == 0)
+            {
+                // No monitors detected, skip adding menu
+                return;
+            }
+            
+            var monitorMenuItem = new ToolStripMenuItem("Apply to Monitor");
+            
+            // Add "All Monitors" option
+            var allMonitorsItem = new ToolStripMenuItem("All Monitors");
+            allMonitorsItem.Checked = (_selectedMonitorIndex == -1);
+            allMonitorsItem.Click += (s, e) => {
+                SaveMonitorSelection(-1);
+                RefreshMonitorMenu();
+                UpdateIconAndText();
+            };
+            monitorMenuItem.DropDownItems.Add(allMonitorsItem);
+            
+            // Add separator
+            monitorMenuItem.DropDownItems.Add(new ToolStripSeparator());
+            
+            // Add individual monitor options
+            foreach (var monitor in _availableMonitors)
+            {
+                var monitorItem = new ToolStripMenuItem(monitor.DisplayName);
+                monitorItem.Checked = (_selectedMonitorIndex == monitor.DisplayNumber);
+                monitorItem.Tag = monitor.DisplayNumber;
+                monitorItem.Click += (s, e) => {
+                    if (s is ToolStripMenuItem item && item.Tag is int displayNum)
+                    {
+                        SaveMonitorSelection(displayNum);
+                        RefreshMonitorMenu();
+                        UpdateIconAndText();
+                    }
+                };
+                monitorMenuItem.DropDownItems.Add(monitorItem);
+            }
+            
+            _contextMenu.Items.Add(monitorMenuItem);
+        }
+        
+        private void RefreshMonitorMenu()
+        {
+            // Find and update the monitor menu items
+            foreach (ToolStripItem item in _contextMenu.Items)
+            {
+                if (item is ToolStripMenuItem menuItem && menuItem.Text == "Apply to Monitor")
+                {
+                    // Update all submenu items
+                    foreach (ToolStripItem subItem in menuItem.DropDownItems)
+                    {
+                        if (subItem is ToolStripMenuItem subMenuItem)
+                        {
+                            if (subMenuItem.Text == "All Monitors")
+                            {
+                                subMenuItem.Checked = (_selectedMonitorIndex == -1);
+                            }
+                            else if (subMenuItem.Tag is int displayNum)
+                            {
+                                subMenuItem.Checked = (_selectedMonitorIndex == displayNum);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
         }
 
 
@@ -247,12 +531,33 @@ namespace SystemTrayApp
             }
         }
 
-        private void UpdateIcon()
+        private void UpdateIconAndText()
         {
             if (_notifyIcon == null) return;
 
             _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon : _gammaIcon;
-            _notifyIcon.Text = _isDefaultProfile ? "Color Profile: Default" : "Color Profile: sRGB to Gamma";
+            
+            // Build tooltip text with monitor information
+            string profileText = _isDefaultProfile ? "Default" : "sRGB to Gamma";
+            string monitorText = GetMonitorDisplayText();
+            
+            _notifyIcon.Text = $"HDR Gamma Fix: {profileText}{monitorText}";
+        }
+        
+        private string GetMonitorDisplayText()
+        {
+            if (_selectedMonitorIndex == -1)
+            {
+                return " (All Monitors)";
+            }
+            
+            var selectedMonitor = _availableMonitors.FirstOrDefault(m => m.DisplayNumber == _selectedMonitorIndex);
+            if (selectedMonitor.DisplayNumber > 0)
+            {
+                return $" ({selectedMonitor.DisplayName})";
+            }
+            
+            return "";
         }
 
         private void ApplySrgbToGamma()
@@ -260,11 +565,12 @@ namespace SystemTrayApp
             if (ExecuteBatchFile("srgb-to-gamma.bat"))
             {
                 _isDefaultProfile = false;
-                UpdateIcon();
+                UpdateIconAndText();
 
                 // Queue the notification instead of showing immediately
+                string monitorInfo = GetMonitorDisplayText();
                 QueueBalloonTip("Profile Changed",
-                              "Applied sRGB to Gamma profile",
+                              $"Applied sRGB to Gamma profile{monitorInfo}",
                               ToolTipIcon.Info);
             }
         }
@@ -274,11 +580,12 @@ namespace SystemTrayApp
             if (ExecuteBatchFile("revert.bat"))
             {
                 _isDefaultProfile = true;
-                UpdateIcon();
+                UpdateIconAndText();
 
                 // Queue the notification instead of showing immediately
+                string monitorInfo = GetMonitorDisplayText();
                 QueueBalloonTip("Profile Changed",
-                              "Reverted to Default profile",
+                              $"Reverted to Default profile{monitorInfo}",
                               ToolTipIcon.Info);
             }
         }
@@ -288,6 +595,92 @@ namespace SystemTrayApp
 
 
         private bool ExecuteBatchFile(string fileName)
+        {
+            // If "All Monitors" is selected (-1), apply to each monitor individually
+            if (_selectedMonitorIndex == -1)
+            {
+                bool success = true;
+                foreach (var monitor in _availableMonitors)
+                {
+                    if (!ExecuteBatchFileForMonitor(fileName, monitor.DisplayNumber))
+                    {
+                        success = false;
+                    }
+                }
+                return success;
+            }
+            // If a specific monitor is selected, use monitor-specific execution
+            else if (_selectedMonitorIndex > 0)
+            {
+                return ExecuteBatchFileForMonitor(fileName, _selectedMonitorIndex);
+            }
+            
+            // Fallback: execute normally (should not normally reach here)
+            return ExecuteBatchFileOriginal(fileName);
+        }
+        
+        private bool ExecuteBatchFileForMonitor(string fileName, int monitorIndex)
+        {
+            try
+            {
+                // Find dispwin.exe path
+                string dispwinPath = FindDispwinExecutable();
+                if (string.IsNullOrEmpty(dispwinPath))
+                {
+                    MessageBox.Show("Could not find dispwin.exe", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    QueueBalloonTip("Error", "Could not find dispwin.exe", ToolTipIcon.Error);
+                    return false;
+                }
+                
+                string workingDirectory = Path.GetDirectoryName(dispwinPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                
+                // Determine the command based on the batch file type
+                string arguments;
+                if (fileName.Contains("srgb-to-gamma"))
+                {
+                    // Apply gamma profile to specific monitor
+                    string lutPath = Path.Combine(workingDirectory, "lut.cal");
+                    arguments = $"-d {monitorIndex} \"{lutPath}\"";
+                }
+                else if (fileName.Contains("revert"))
+                {
+                    // Clear profile from specific monitor  
+                    arguments = $"-d {monitorIndex} -c";
+                }
+                else
+                {
+                    // Fallback to original batch file execution
+                    return ExecuteBatchFileOriginal(fileName);
+                }
+
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = dispwinPath,
+                    Arguments = arguments,
+                    UseShellExecute = true,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    WorkingDirectory = workingDirectory
+                };
+
+                using Process process = Process.Start(psi);
+                if (process != null)
+                {
+                    process.WaitForExit(10000); // 10 second timeout
+                    return process.ExitCode == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error executing monitor-specific command: {ex.Message}", "Error", 
+                               MessageBoxButtons.OK, MessageBoxIcon.Error);
+                QueueBalloonTip("Error", $"Error executing command: {ex.Message}", ToolTipIcon.Error);
+            }
+
+            return false;
+        }
+        
+        private bool ExecuteBatchFileOriginal(string fileName)
         {
             string foundPath = null;
             try
