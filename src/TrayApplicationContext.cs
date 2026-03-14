@@ -47,6 +47,10 @@ namespace SystemTrayApp
         
         // --- Notification Settings ---
         private bool _notificationsEnabled = true; // Default to enabled, loaded from registry
+
+        // --- Display Settings Change Monitoring ---
+        private System.Windows.Forms.Timer _reapplyDebounceTimer;
+        private const int ReapplyDebounceMilliseconds = 2000; // 2 second debounce before reapplying
         
         // Monitor information structure
         public struct MonitorInfo
@@ -66,11 +70,23 @@ namespace SystemTrayApp
         public TrayApplicationContext()
         {
             InitializeNotificationTimer(); // Initialize the notification timer first
+            InitializeReapplyTimer();      // Initialize the reapply debounce timer
             DetectAvailableMonitors(); // Detect monitors
             LoadMonitorSelection(); // Load user's monitor preference
             LoadNotificationSetting(); // Load user's notification preference
             InitializeComponent(); // Initialize UI elements
             RegisterHotkeys();     // Register hotkeys
+
+            // Subscribe to system-level display settings changes as a secondary signal.
+            // Wrapped in try-catch because SystemEvents can throw in non-interactive sessions.
+            try
+            {
+                SystemEvents.DisplaySettingsChanged += OnSystemDisplaySettingsChanged;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Could not subscribe to display settings change events: {ex.Message}");
+            }
 
             // Apply the profile on startup (notification will be queued)
             ApplySrgbToGamma();
@@ -156,6 +172,63 @@ namespace SystemTrayApp
                 ShowBalloonTipInternal(details.Title, details.Message, details.Icon); // Call the internal method
                 _pendingNotificationDetails = null; // Clear pending details
             }
+        }
+
+        // --- Initialize Reapply Debounce Timer ---
+        private void InitializeReapplyTimer()
+        {
+            _reapplyDebounceTimer = new System.Windows.Forms.Timer
+            {
+                Interval = ReapplyDebounceMilliseconds
+            };
+            _reapplyDebounceTimer.Tick += ReapplyTimer_Tick;
+        }
+
+        // --- Reapply Timer Tick ---
+        private void ReapplyTimer_Tick(object sender, EventArgs e)
+        {
+            _reapplyDebounceTimer.Stop();
+            ReapplyGammaFix();
+        }
+
+        // --- Schedule a Debounced Gamma Reapplication ---
+        private void ScheduleGammaReapply()
+        {
+            // Only schedule if the gamma fix is currently active
+            if (_isDefaultProfile)
+                return;
+
+            // Reset the debounce timer so rapid events are collapsed into one reapplication
+            _reapplyDebounceTimer.Stop();
+            _reapplyDebounceTimer.Start();
+        }
+
+        // --- Reapply Gamma Fix Silently ---
+        /// <summary>
+        /// Re-applies the gamma fix without changing the active/inactive state.
+        /// Called automatically when a display settings change is detected.
+        /// </summary>
+        private void ReapplyGammaFix()
+        {
+            if (ExecuteBatchFile("srgb-to-gamma.bat"))
+            {
+                string monitorInfo = GetMonitorDisplayText();
+                QueueBalloonTip("Gamma Fix Reapplied",
+                              $"Gamma fix was automatically reapplied{monitorInfo}",
+                              ToolTipIcon.Info);
+            }
+        }
+
+        // --- Handler for SystemEvents.DisplaySettingsChanged ---
+        private void OnSystemDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            ScheduleGammaReapply();
+        }
+
+        // --- Handler for HotkeyMessageHandler.DisplaySettingsChanged ---
+        private void OnMessageHandlerDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            ScheduleGammaReapply();
         }
 
         // --- Queue Notification Method ---
@@ -449,6 +522,7 @@ namespace SystemTrayApp
         {
             _messageHandler = new HotkeyMessageHandler();
             _messageHandler.HotkeyPressed += OnHotkeyPressed;
+            _messageHandler.DisplaySettingsChanged += OnMessageHandlerDisplaySettingsChanged;
 
             if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, MOD_ALT, VK_F1))
             {
@@ -474,6 +548,7 @@ namespace SystemTrayApp
                 UnregisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA);
                 UnregisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT);
                 _messageHandler.HotkeyPressed -= OnHotkeyPressed;
+                _messageHandler.DisplaySettingsChanged -= OnMessageHandlerDisplaySettingsChanged;
                 _messageHandler.Dispose();
                 _messageHandler = null;
             }
@@ -760,9 +835,14 @@ namespace SystemTrayApp
         {
             if (disposing)
             {
+                // Unsubscribe from system events
+                SystemEvents.DisplaySettingsChanged -= OnSystemDisplaySettingsChanged;
+
                 // Dispose managed resources
                 _notificationTimer?.Stop(); // Stop the timer before disposing
                 _notificationTimer?.Dispose();
+                _reapplyDebounceTimer?.Stop();
+                _reapplyDebounceTimer?.Dispose();
                 _defaultIcon?.Dispose();
                 _gammaIcon?.Dispose();
                 _notifyIcon?.Dispose();
@@ -839,8 +919,11 @@ namespace SystemTrayApp
     public class HotkeyMessageHandler : Form
     {
         private const int WM_HOTKEY = 0x0312;
+        private const int WM_DISPLAYCHANGE = 0x007E;
+        private const int WM_SETTINGCHANGE = 0x001A;
 
         public event Action<int> HotkeyPressed;
+        public event EventHandler DisplaySettingsChanged;
 
         public HotkeyMessageHandler()
         {
@@ -873,6 +956,10 @@ namespace SystemTrayApp
             {
                 int hotkeyId = m.WParam.ToInt32();
                 HotkeyPressed?.Invoke(hotkeyId);
+            }
+            else if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_SETTINGCHANGE)
+            {
+                DisplaySettingsChanged?.Invoke(this, EventArgs.Empty);
             }
             base.WndProc(ref m);
         }
