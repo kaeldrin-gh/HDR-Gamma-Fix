@@ -63,9 +63,7 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 ### Required Files for Distribution
 When moving or sharing the application, ensure these files stay together:
 - HDRGammaFix.exe
-- HDRGammaFix.dll
-- HDRGammaFix.deps.json
-- HDRGammaFix.runtimeconfig.json
+- HDRGammaFix.pdb
 - scripts/dispwin.exe
 - scripts/lut.cal
 - scripts/srgb-to-gamma.bat
