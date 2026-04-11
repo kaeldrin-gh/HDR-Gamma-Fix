@@ -888,7 +888,7 @@ namespace SystemTrayApp
                 {
                     FileName = dispwinPath,
                     Arguments = arguments,
-                    UseShellExecute = true,
+                    UseShellExecute = false,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden,
                     WorkingDirectory = workingDirectory
@@ -944,7 +944,7 @@ namespace SystemTrayApp
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = foundPath,
-                    UseShellExecute = true,
+                    UseShellExecute = false,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden,
                     WorkingDirectory = workingDirectory
