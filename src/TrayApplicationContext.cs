@@ -310,10 +310,14 @@ namespace SystemTrayApp
             // Windows is shutting down or logging off. Launching dispwin.exe now would get it
             // killed mid-run and pop a "dispwin.exe stopped working" error, so stop everything.
             _sessionEnding = true;
-            _profileRecoveryTimer?.Stop();
-            _settingsWatchdogTimer?.Stop();
-            _pendingProfileRecoveryReason = null;
-            _pendingProfileRecoveryNotification = false;
+
+            RunOnUiThread(() =>
+            {
+                _profileRecoveryTimer.Stop();
+                _settingsWatchdogTimer.Stop();
+                _pendingProfileRecoveryReason = null;
+                _pendingProfileRecoveryNotification = false;
+            });
         }
 
         private void OnDisplaySettingsChanged(object? sender, EventArgs e)
