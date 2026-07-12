@@ -53,6 +53,7 @@ namespace SystemTrayApp
         private string? _pendingProfileRecoveryReason;
         private bool _pendingProfileRecoveryNotification;
         private bool _wasSystemSettingsRunning;
+        private bool _sessionEnding; // Suppresses dispwin launches once Windows shutdown/logoff begins
 
         // --- Monitor Selection ---
         private List<MonitorInfo> _availableMonitors = new List<MonitorInfo>();
@@ -294,12 +295,29 @@ namespace SystemTrayApp
         {
             SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+            SystemEvents.SessionEnding += OnSessionEnding;
         }
 
         private void UnregisterSystemEventHandlers()
         {
             SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            SystemEvents.SessionEnding -= OnSessionEnding;
+        }
+
+        private void OnSessionEnding(object? sender, SessionEndingEventArgs e)
+        {
+            // Windows is shutting down or logging off. Launching dispwin.exe now would get it
+            // killed mid-run and pop a "dispwin.exe stopped working" error, so stop everything.
+            _sessionEnding = true;
+
+            RunOnUiThread(() =>
+            {
+                _profileRecoveryTimer.Stop();
+                _settingsWatchdogTimer.Stop();
+                _pendingProfileRecoveryReason = null;
+                _pendingProfileRecoveryNotification = false;
+            });
         }
 
         private void OnDisplaySettingsChanged(object? sender, EventArgs e)
@@ -328,7 +346,7 @@ namespace SystemTrayApp
 
         private void ScheduleProfileRecovery(string reason, bool showNotification = true)
         {
-            if (_isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
+            if (_sessionEnding || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
                 return;
             }
@@ -769,6 +787,11 @@ namespace SystemTrayApp
 
         private void ApplySrgbToGamma(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
         {
+            if (_sessionEnding)
+            {
+                return;
+            }
+
             SuppressProfileRecoveryEvents();
 
             if (ExecuteBatchFile("srgb-to-gamma.bat"))
