@@ -313,8 +313,8 @@ namespace SystemTrayApp
 
             RunOnUiThread(() =>
             {
-                _profileRecoveryTimer?.Stop();
-                _settingsWatchdogTimer?.Stop();
+                try { _profileRecoveryTimer?.Stop(); } catch (ObjectDisposedException) { }
+                try { _settingsWatchdogTimer?.Stop(); } catch (ObjectDisposedException) { }
                 _pendingProfileRecoveryReason = null;
                 _pendingProfileRecoveryNotification = false;
             });
