@@ -13,6 +13,9 @@
     <Product>HDR Gamma Fix</Product>
     <Title>HDR Gamma Fix</Title>
     <Description>Utility to fix gamma issues when using HDR</Description>
+    <Version>1.2.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
+    <FileVersion>1.2.0</FileVersion>
     
     <!-- Set the application icon -->
     <ApplicationIcon>Resources\GammaIcon.ico</ApplicationIcon>
