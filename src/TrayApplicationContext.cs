@@ -62,6 +62,7 @@ namespace SystemTrayApp
         private bool _wasSystemSettingsRunning;
         private bool _sessionEnding; // Suppresses dispwin launches once Windows shutdown/logoff begins
         private bool _isOperationInProgress; // Prevents overlapping dispwin.exe launches (e.g. rapid Alt+F1 presses)
+        private Process? _activeDispwinProcess; // Track in-flight dispwin.exe so it can't be orphaned on exit
 
         // --- Monitor Selection ---
         private List<MonitorInfo> _availableMonitors = new List<MonitorInfo>();
@@ -1105,6 +1106,9 @@ namespace SystemTrayApp
                     return false;
                 }
 
+                // Track the running process so OnExit can wait for it instead of orphaning it
+                _activeDispwinProcess = process;
+
                 // Wait asynchronously so the UI thread stays responsive
                 await process.WaitForExitAsync(timeoutCts.Token);
                 return process.ExitCode == 0;
@@ -1138,12 +1142,20 @@ namespace SystemTrayApp
                     }
                     process.Dispose();
                 }
+                if (ReferenceEquals(_activeDispwinProcess, process))
+                {
+                    _activeDispwinProcess = null;
+                }
             }
         }
 
 
         private void OnExit(object? sender, EventArgs e)
         {
+            // Wait for any in-flight dispwin.exe to finish (or kill it) so it isn't
+            // orphaned and doesn't apply/change the gamma after the app has exited.
+            WaitForActiveDispwinToFinish();
+
             _profileRecoveryTimer?.Stop();
             _settingsWatchdogTimer?.Stop();
             UnregisterSystemEventHandlers();
@@ -1154,6 +1166,36 @@ namespace SystemTrayApp
             }
             UnregisterHotkeys();
             Application.Exit();
+        }
+
+        private void WaitForActiveDispwinToFinish()
+        {
+            Process? process = _activeDispwinProcess;
+            if (process == null)
+            {
+                return;
+            }
+
+            try
+            {
+                // dispwin normally completes in well under a second. Give it a short
+                // grace period to finish cleanly, then force it down if it hangs.
+                if (!process.WaitForExit(5000))
+                {
+                    Debug.WriteLine("dispwin.exe did not finish in time during app exit; terminating it.");
+                    process.Kill();
+                    process.WaitForExit();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error waiting for dispwin.exe to exit: {ex}");
+            }
+            finally
+            {
+                process.Dispose();
+                _activeDispwinProcess = null;
+            }
         }
 
         protected override void Dispose(bool disposing)
