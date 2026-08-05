@@ -26,12 +26,19 @@ namespace SystemTrayApp
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
-        // Hotkey constants
+        // Hotkey IDs
         private const int HOTKEY_ID_GAMMA = 1;
         private const int HOTKEY_ID_DEFAULT = 2;
-        private const uint MOD_ALT = 0x0001;
-        private const uint VK_F1 = 0x70;
-        private const uint VK_F2 = 0x71;
+
+        // Configurable hotkey settings (defaults to Alt+F1 / Alt+F2, loaded from registry)
+        private uint _gammaModifiers = HotkeySettings.MOD_ALT;
+        private uint _gammaVk = 0x70; // F1
+        private uint _defaultModifiers = HotkeySettings.MOD_ALT;
+        private uint _defaultVk = 0x71; // F2
+
+        // Menu items whose text reflects the current hotkeys
+        private ToolStripMenuItem _applyMenuItem = null!;
+        private ToolStripMenuItem _revertMenuItem = null!;
 
         // Message handler form for hotkeys
         private HotkeyMessageHandler? _messageHandler;
@@ -54,6 +61,7 @@ namespace SystemTrayApp
         private bool _pendingProfileRecoveryNotification;
         private bool _wasSystemSettingsRunning;
         private bool _sessionEnding; // Suppresses dispwin launches once Windows shutdown/logoff begins
+        private bool _isOperationInProgress; // Prevents overlapping dispwin.exe launches (e.g. rapid Alt+F1 presses)
 
         // --- Monitor Selection ---
         private List<MonitorInfo> _availableMonitors = new List<MonitorInfo>();
@@ -85,12 +93,13 @@ namespace SystemTrayApp
             DetectAvailableMonitors(); // Detect monitors
             LoadMonitorSelection(); // Load user's monitor preference
             LoadNotificationSetting(); // Load user's notification preference
+            LoadHotkeySettings(); // Load user's hotkey preference
             InitializeComponent(); // Initialize UI elements
             RegisterHotkeys();     // Register hotkeys
             RegisterSystemEventHandlers();
 
             // Apply the profile on startup (notification will be queued)
-            ApplySrgbToGamma();
+            _ = ApplySrgbToGammaAsync();
         }
 
         private void InitializeComponent()
@@ -99,8 +108,14 @@ namespace SystemTrayApp
             _contextMenu = new ContextMenuStrip();
 
             // Add our action buttons
-            _contextMenu.Items.Add("Apply sRGB to Gamma (Alt+F1)", null, OnApplySrgbToGamma);
-            _contextMenu.Items.Add("Revert to Default (Alt+F2)", null, OnRevertToDefault);
+            _applyMenuItem = new ToolStripMenuItem(
+                $"Apply sRGB to Gamma ({HotkeySettings.Format(_gammaModifiers, _gammaVk)})",
+                null, OnApplySrgbToGamma);
+            _revertMenuItem = new ToolStripMenuItem(
+                $"Revert to Default ({HotkeySettings.Format(_defaultModifiers, _defaultVk)})",
+                null, OnRevertToDefault);
+            _contextMenu.Items.Add(_applyMenuItem);
+            _contextMenu.Items.Add(_revertMenuItem);
             _contextMenu.Items.Add(new ToolStripSeparator());
 
             // Add start with Windows option
@@ -125,6 +140,11 @@ namespace SystemTrayApp
                 SaveNotificationSetting(notificationItem.Checked);
             };
             _contextMenu.Items.Add(notificationItem);
+            
+            // Add hotkey configuration option
+            var hotkeyItem = new ToolStripMenuItem("Configure Hotkeys...");
+            hotkeyItem.Click += OnConfigureHotkeys;
+            _contextMenu.Items.Add(hotkeyItem);
             
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add("Exit", null, OnExit);
@@ -175,7 +195,7 @@ namespace SystemTrayApp
             _settingsWatchdogTimer = new System.Windows.Forms.Timer
             {
                 Interval = SettingsWatchdogIntervalMilliseconds,
-                Enabled = true
+                Enabled = false // Only runs while the gamma profile is active
             };
             _settingsWatchdogTimer.Tick += SettingsWatchdogTimer_Tick;
         }
@@ -194,7 +214,7 @@ namespace SystemTrayApp
             }
         }
 
-        private void ProfileRecoveryTimer_Tick(object? sender, EventArgs e)
+        private async void ProfileRecoveryTimer_Tick(object? sender, EventArgs e)
         {
             _profileRecoveryTimer.Stop();
 
@@ -210,7 +230,7 @@ namespace SystemTrayApp
             _pendingProfileRecoveryReason = null;
             _pendingProfileRecoveryNotification = false;
 
-            ApplySrgbToGamma(
+            await ApplySrgbToGammaAsync(
                 showNotification: showRecoveryNotification,
                 isAutomaticRecovery: true,
                 recoveryReason: recoveryReason);
@@ -371,8 +391,9 @@ namespace SystemTrayApp
             {
                 return Process.GetProcessesByName("SystemSettings").Length > 0;
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"Error checking SystemSettings process: {ex}");
                 return false;
             }
         }
@@ -432,9 +453,10 @@ namespace SystemTrayApp
                     ParseMonitorsFromDispwinOutput(fullOutput);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // If parsing fails, fall back to single monitor
+                Debug.WriteLine($"Error detecting monitors via dispwin: {ex}");
             }
             
             // If no monitors detected, add primary as fallback
@@ -471,9 +493,10 @@ namespace SystemTrayApp
                             _availableMonitors.Add(new MonitorInfo(monitorNum, displayName, true));
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
                         // Skip malformed lines
+                        Debug.WriteLine($"Skipping malformed monitor line: {ex.Message}");
                     }
                 }
             }
@@ -496,7 +519,7 @@ namespace SystemTrayApp
             try
             {
                 using RegistryKey? key = Registry.CurrentUser.OpenSubKey(
-                    @"SOFTWARE\HDRGammaFix", false);
+                    RegistryKeyPath, false);
                 
                 if (key?.GetValue("SelectedMonitor") is int selectedMonitor)
                 {
@@ -507,8 +530,9 @@ namespace SystemTrayApp
                     _selectedMonitorIndex = -1; // Default to all monitors
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"Error loading monitor selection: {ex}");
                 _selectedMonitorIndex = -1; // Default to all monitors on error
             }
         }
@@ -518,7 +542,7 @@ namespace SystemTrayApp
             try
             {
                 using RegistryKey? key = Registry.CurrentUser.OpenSubKey(
-                    @"SOFTWARE\HDRGammaFix", false);
+                    RegistryKeyPath, false);
                 
                 if (key?.GetValue("NotificationsEnabled") is int notificationValue)
                 {
@@ -529,8 +553,9 @@ namespace SystemTrayApp
                     _notificationsEnabled = true; // Default to enabled
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"Error loading notification setting: {ex}");
                 _notificationsEnabled = true; // Default to enabled on error
             }
         }
@@ -539,13 +564,14 @@ namespace SystemTrayApp
         {
             try
             {
-                using RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\HDRGammaFix");
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
                 key?.SetValue("SelectedMonitor", monitorIndex);
                 _selectedMonitorIndex = monitorIndex;
             }
-            catch
+            catch (Exception ex)
             {
                 // Ignore save errors
+                Debug.WriteLine($"Error saving monitor selection: {ex}");
             }
         }
         
@@ -553,14 +579,120 @@ namespace SystemTrayApp
         {
             try
             {
-                using RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\HDRGammaFix");
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
                 key?.SetValue("NotificationsEnabled", enabled ? 1 : 0);
                 _notificationsEnabled = enabled;
             }
-            catch
+            catch (Exception ex)
             {
                 // Ignore save errors
+                Debug.WriteLine($"Error saving notification setting: {ex}");
             }
+        }
+        
+        // --- Hotkey Configuration ---
+        private void LoadHotkeySettings()
+        {
+            _gammaModifiers = HotkeySettings.MOD_ALT;
+            _gammaVk = 0x70; // F1
+            _defaultModifiers = HotkeySettings.MOD_ALT;
+            _defaultVk = 0x71; // F2
+
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath, false);
+
+                if (HotkeySettings.TryParse(key?.GetValue("GammaHotkey") as string, out uint gammaModifiers, out uint gammaVk))
+                {
+                    _gammaModifiers = gammaModifiers;
+                    _gammaVk = gammaVk;
+                }
+                if (HotkeySettings.TryParse(key?.GetValue("DefaultHotkey") as string, out uint defaultModifiers, out uint defaultVk))
+                {
+                    _defaultModifiers = defaultModifiers;
+                    _defaultVk = defaultVk;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading hotkey settings: {ex}");
+            }
+        }
+        
+        private void SaveHotkeySettings()
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
+                key?.SetValue("GammaHotkey", HotkeySettings.Format(_gammaModifiers, _gammaVk));
+                key?.SetValue("DefaultHotkey", HotkeySettings.Format(_defaultModifiers, _defaultVk));
+            }
+            catch (Exception ex)
+            {
+                // Ignore save errors
+                Debug.WriteLine($"Error saving hotkey settings: {ex}");
+            }
+        }
+        
+        private void UpdateHotkeyMenuText()
+        {
+            if (_applyMenuItem != null)
+            {
+                _applyMenuItem.Text = $"Apply sRGB to Gamma ({HotkeySettings.Format(_gammaModifiers, _gammaVk)})";
+            }
+            if (_revertMenuItem != null)
+            {
+                _revertMenuItem.Text = $"Revert to Default ({HotkeySettings.Format(_defaultModifiers, _defaultVk)})";
+            }
+        }
+        
+        private void OnConfigureHotkeys(object? sender, EventArgs e)
+        {
+            using var dialog = new HotkeyConfigDialog(_gammaModifiers, _gammaVk, _defaultModifiers, _defaultVk);
+            if (dialog.ShowDialog() != DialogResult.OK)
+            {
+                return;
+            }
+
+            uint newGammaModifiers = dialog.GammaModifiers;
+            uint newGammaVk = dialog.GammaVk;
+            uint newDefaultModifiers = dialog.DefaultModifiers;
+            uint newDefaultVk = dialog.DefaultVk;
+
+            // Unregister old hotkeys and try to register the new ones. If either fails
+            // (e.g. already in use by another app), keep the previous configuration.
+            UnregisterHotkey(HOTKEY_ID_GAMMA);
+            UnregisterHotkey(HOTKEY_ID_DEFAULT);
+
+            bool gammaOk = _messageHandler != null && !_messageHandler.IsDisposed
+                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, newGammaModifiers, newGammaVk);
+            bool defaultOk = _messageHandler != null && !_messageHandler.IsDisposed
+                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, newDefaultModifiers, newDefaultVk);
+
+            if (!gammaOk || !defaultOk)
+            {
+                // Roll back to the previous hotkeys
+                UnregisterHotkey(HOTKEY_ID_GAMMA);
+                UnregisterHotkey(HOTKEY_ID_DEFAULT);
+                RegisterHotKey(_messageHandler!.Handle, HOTKEY_ID_GAMMA, _gammaModifiers, _gammaVk);
+                RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers, _defaultVk);
+
+                QueueBalloonTip("Hotkey Registration Failed",
+                              "The chosen hotkey could not be registered (it may be in use). Keeping the previous hotkeys.",
+                              ToolTipIcon.Warning);
+                return;
+            }
+
+            _gammaModifiers = newGammaModifiers;
+            _gammaVk = newGammaVk;
+            _defaultModifiers = newDefaultModifiers;
+            _defaultVk = newDefaultVk;
+            SaveHotkeySettings();
+            UpdateHotkeyMenuText();
+
+            QueueBalloonTip("Hotkeys Updated",
+                          $"Apply: {HotkeySettings.Format(_gammaModifiers, _gammaVk)} | Revert: {HotkeySettings.Format(_defaultModifiers, _defaultVk)}",
+                          ToolTipIcon.Info);
         }
         
         private void AddMonitorSelectionMenu()
@@ -641,20 +773,28 @@ namespace SystemTrayApp
             _messageHandler.DisplayConfigurationChanged += OnDisplayConfigurationChanged;
             _messageHandler.SystemSettingChanged += OnSystemSettingChanged;
 
-            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, MOD_ALT, VK_F1))
+            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, _gammaModifiers, _gammaVk))
             {
                 // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
-                              "Could not register Alt+F1 hotkey. It may be in use by another application.",
+                              $"Could not register {HotkeySettings.Format(_gammaModifiers, _gammaVk)} hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
             }
 
-            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, MOD_ALT, VK_F2))
+            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers, _defaultVk))
             {
                  // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
-                              "Could not register Alt+F2 hotkey. It may be in use by another application.",
+                              $"Could not register {HotkeySettings.Format(_defaultModifiers, _defaultVk)} hotkey. It may be in use by another application.",
                               ToolTipIcon.Warning);
+            }
+        }
+
+        private void UnregisterHotkey(int hotkeyId)
+        {
+            if (_messageHandler != null && !_messageHandler.IsDisposed)
+            {
+                UnregisterHotKey(_messageHandler.Handle, hotkeyId);
             }
         }
 
@@ -672,16 +812,16 @@ namespace SystemTrayApp
             }
         }
 
-        private void OnHotkeyPressed(int hotkeyId)
+        private async void OnHotkeyPressed(int hotkeyId)
         {
             switch (hotkeyId)
             {
                 case HOTKEY_ID_GAMMA:
-                    ApplySrgbToGamma();
+                    await ApplySrgbToGammaAsync();
                     break;
 
                 case HOTKEY_ID_DEFAULT:
-                    RevertToDefault();
+                    await RevertToDefaultAsync();
                     break;
             }
         }
@@ -744,15 +884,15 @@ namespace SystemTrayApp
             }
         }
 
-        private void ToggleProfile()
+        private async void ToggleProfile()
         {
             if (_isDefaultProfile)
             {
-                ApplySrgbToGamma();
+                await ApplySrgbToGammaAsync();
             }
             else
             {
-                RevertToDefault();
+                await RevertToDefaultAsync();
             }
         }
 
@@ -785,70 +925,92 @@ namespace SystemTrayApp
             return "";
         }
 
-        private void ApplySrgbToGamma(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
+        private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
         {
-            if (_sessionEnding)
+            if (_sessionEnding || _isOperationInProgress)
             {
                 return;
             }
 
-            SuppressProfileRecoveryEvents();
-
-            if (ExecuteBatchFile("srgb-to-gamma.bat"))
+            _isOperationInProgress = true;
+            try
             {
-                _settingsWatchdogTimer.Start();
-                _isDefaultProfile = false;
-                UpdateIconAndText();
+                SuppressProfileRecoveryEvents();
 
-                if (isAutomaticRecovery)
+                if (await ExecuteBatchFileAsync("srgb-to-gamma.bat"))
                 {
-                    if (showNotification)
+                    _settingsWatchdogTimer.Start();
+                    _isDefaultProfile = false;
+                    UpdateIconAndText();
+
+                    if (isAutomaticRecovery)
                     {
-                        QueueBalloonTip("Profile Reapplied",
-                                      $"{recoveryReason ?? "Windows reset the gamma ramp."} HDR Gamma Fix restored the active profile{GetMonitorDisplayText()}",
+                        if (showNotification)
+                        {
+                            QueueBalloonTip("Profile Reapplied",
+                                          $"{recoveryReason ?? "Windows reset the gamma ramp."} HDR Gamma Fix restored the active profile{GetMonitorDisplayText()}",
+                                          ToolTipIcon.Info);
+                        }
+                    }
+                    else if (showNotification)
+                    {
+                        // Queue the notification instead of showing immediately
+                        string monitorInfo = GetMonitorDisplayText();
+                        QueueBalloonTip("Profile Changed",
+                                      $"Applied sRGB to Gamma profile{monitorInfo}",
                                       ToolTipIcon.Info);
                     }
                 }
-                else if (showNotification)
-                {
-                    // Queue the notification instead of showing immediately
-                    string monitorInfo = GetMonitorDisplayText();
-                    QueueBalloonTip("Profile Changed",
-                                  $"Applied sRGB to Gamma profile{monitorInfo}",
-                                  ToolTipIcon.Info);
-                }
             }
-        }
-
-        private void RevertToDefault(bool showNotification = true)
-        {
-            SuppressProfileRecoveryEvents();
-            _profileRecoveryTimer.Stop();
-            _pendingProfileRecoveryReason = null;
-            _pendingProfileRecoveryNotification = false;
-            _wasSystemSettingsRunning = false;
-
-            if (ExecuteBatchFile("revert.bat"))
+            finally
             {
-                _isDefaultProfile = true;
-                UpdateIconAndText();
-
-                if (showNotification)
-                {
-                    // Queue the notification instead of showing immediately
-                    string monitorInfo = GetMonitorDisplayText();
-                    QueueBalloonTip("Profile Changed",
-                                  $"Reverted to Default profile{monitorInfo}",
-                                  ToolTipIcon.Info);
-                }
+                _isOperationInProgress = false;
             }
         }
 
-        private void OnApplySrgbToGamma(object? sender, EventArgs e) => ApplySrgbToGamma();
-        private void OnRevertToDefault(object? sender, EventArgs e) => RevertToDefault();
+        private async Task RevertToDefaultAsync(bool showNotification = true)
+        {
+            if (_isOperationInProgress)
+            {
+                return;
+            }
+
+            _isOperationInProgress = true;
+            try
+            {
+                SuppressProfileRecoveryEvents();
+                _profileRecoveryTimer.Stop();
+                _pendingProfileRecoveryReason = null;
+                _pendingProfileRecoveryNotification = false;
+                _wasSystemSettingsRunning = false;
+                _settingsWatchdogTimer.Stop(); // No need to watch settings while in default state
+
+                if (await ExecuteBatchFileAsync("revert.bat"))
+                {
+                    _isDefaultProfile = true;
+                    UpdateIconAndText();
+
+                    if (showNotification)
+                    {
+                        // Queue the notification instead of showing immediately
+                        string monitorInfo = GetMonitorDisplayText();
+                        QueueBalloonTip("Profile Changed",
+                                      $"Reverted to Default profile{monitorInfo}",
+                                      ToolTipIcon.Info);
+                    }
+                }
+            }
+            finally
+            {
+                _isOperationInProgress = false;
+            }
+        }
+
+        private async void OnApplySrgbToGamma(object? sender, EventArgs e) => await ApplySrgbToGammaAsync();
+        private async void OnRevertToDefault(object? sender, EventArgs e) => await RevertToDefaultAsync();
 
 
-        private bool ExecuteBatchFile(string fileName)
+        private async Task<bool> ExecuteBatchFileAsync(string fileName)
         {
             // If "All Monitors" is selected (-1), apply to each monitor individually
             if (_selectedMonitorIndex == -1)
@@ -856,7 +1018,7 @@ namespace SystemTrayApp
                 bool success = true;
                 foreach (var monitor in _availableMonitors)
                 {
-                    if (!ExecuteBatchFileForMonitor(fileName, monitor.DisplayNumber))
+                    if (!await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber))
                     {
                         success = false;
                     }
@@ -866,14 +1028,14 @@ namespace SystemTrayApp
             // If a specific monitor is selected, use monitor-specific execution
             else if (_selectedMonitorIndex > 0)
             {
-                return ExecuteBatchFileForMonitor(fileName, _selectedMonitorIndex);
+                return await ExecuteBatchFileForMonitorAsync(fileName, _selectedMonitorIndex);
             }
             
-            // Fallback: execute normally (should not normally reach here)
-            return ExecuteBatchFileOriginal(fileName);
+            // Invalid monitor index (should not normally reach here)
+            return false;
         }
         
-        private bool ExecuteBatchFileForMonitor(string fileName, int monitorIndex)
+        private async Task<bool> ExecuteBatchFileForMonitorAsync(string fileName, int monitorIndex)
         {
             try
             {
@@ -903,10 +1065,28 @@ namespace SystemTrayApp
                 }
                 else
                 {
-                    // Fallback to original batch file execution
-                    return ExecuteBatchFileOriginal(fileName);
+                    // Unknown operation
+                    return false;
                 }
 
+                return await RunDispwinAsync(dispwinPath, arguments, workingDirectory);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error executing monitor-specific command: {ex.Message}", "Error", 
+                               MessageBoxButtons.OK, MessageBoxIcon.Error);
+                QueueBalloonTip("Error", $"Error executing command: {ex.Message}", ToolTipIcon.Error);
+                Debug.WriteLine($"Error executing monitor-specific command: {ex}");
+            }
+
+            return false;
+        }
+
+        private async Task<bool> RunDispwinAsync(string dispwinPath, string arguments, string workingDirectory)
+        {
+            Process? process = null;
+            try
+            {
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = dispwinPath,
@@ -917,85 +1097,47 @@ namespace SystemTrayApp
                     WorkingDirectory = workingDirectory
                 };
 
-                using Process? process = Process.Start(psi);
-                if (process != null)
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+                process = Process.Start(psi);
+                if (process == null)
                 {
-                    process.WaitForExit(10000); // 10 second timeout
-                    return process.ExitCode == 0;
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Error executing monitor-specific command: {ex.Message}", "Error", 
-                               MessageBoxButtons.OK, MessageBoxIcon.Error);
-                QueueBalloonTip("Error", $"Error executing command: {ex.Message}", ToolTipIcon.Error);
-            }
-
-            return false;
-        }
-        
-        private bool ExecuteBatchFileOriginal(string fileName)
-        {
-            string? foundPath = null;
-            try
-            {
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string[] possibleRelativePaths = new string[]
-                {
-                    fileName,
-                    Path.Combine("scripts", fileName)
-                };
-
-                foundPath = possibleRelativePaths
-                                .Select(relativePath => Path.Combine(baseDir, relativePath))
-                                .FirstOrDefault(File.Exists);
-
-                if (string.IsNullOrEmpty(foundPath))
-                {
-                    string attemptedPaths = string.Join(Environment.NewLine + "  - ",
-                        possibleRelativePaths.Select(p => Path.Combine(baseDir, p)));
-                    string errorMsg = $"Could not find '{fileName}'. Tried the following locations:{Environment.NewLine}  - {attemptedPaths}";
-
-                    MessageBox.Show(errorMsg, "File Not Found", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    // Use QueueBalloonTip for consistency, even for errors shown via MessageBox
-                    QueueBalloonTip("Error", $"Could not find {fileName}", ToolTipIcon.Error);
                     return false;
                 }
 
-                string workingDirectory = Path.GetDirectoryName(foundPath) ?? baseDir;
-
-                ProcessStartInfo psi = new ProcessStartInfo
-                {
-                    FileName = foundPath,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden,
-                    WorkingDirectory = workingDirectory
-                };
-
-                using (Process? process = Process.Start(psi))
-                {
-                    if (process == null)
-                    {
-                        string errorMsg = $"Failed to start process for '{fileName}'.";
-                        MessageBox.Show(errorMsg, "Execution Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        QueueBalloonTip("Error", $"Failed to execute {fileName}", ToolTipIcon.Error);
-                        return false;
-                    }
-                }
-
-                return true;
+                // Wait asynchronously so the UI thread stays responsive
+                await process.WaitForExitAsync(timeoutCts.Token);
+                return process.ExitCode == 0;
+            }
+            catch (OperationCanceledException)
+            {
+                // Timed out: make sure the process is not left running in the background
+                Debug.WriteLine($"dispwin.exe timed out. Arguments: {arguments}");
+                return false;
             }
             catch (Exception ex)
             {
-                string errorMsg = $"Error executing '{fileName}': {ex.Message}";
-                if (!string.IsNullOrEmpty(foundPath)) {
-                    errorMsg += $"\nPath: {foundPath}";
-                }
-                MessageBox.Show(errorMsg, "Execution Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                QueueBalloonTip("Error", $"Error executing {fileName}", ToolTipIcon.Error);
-                Debug.WriteLine($"Execution Error: {errorMsg}\n{ex.StackTrace}");
+                Debug.WriteLine($"Error executing dispwin.exe ({arguments}): {ex}");
+                QueueBalloonTip("Error", $"Error executing command: {ex.Message}", ToolTipIcon.Error);
                 return false;
+            }
+            finally
+            {
+                if (process != null)
+                {
+                    try
+                    {
+                        if (!process.HasExited)
+                        {
+                            process.Kill();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to clean up dispwin.exe process: {ex}");
+                    }
+                    process.Dispose();
+                }
             }
         }
 
@@ -1038,6 +1180,7 @@ namespace SystemTrayApp
 
         // --- Startup Configuration ---
         private const string AppRegistryName = "HDRGammaFix";
+        private const string RegistryKeyPath = @"SOFTWARE\HDRGammaFix";
 
         private void SetStartup(bool enable)
         {

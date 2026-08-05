@@ -40,8 +40,9 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 - **Visual Status:** Tray icon tooltip shows current profile and selected monitor(s)
 
 ### Menu Options
-- Apply sRGB to Gamma (Alt+F1)
-- Revert to Default (Alt+F2)
+- Apply sRGB to Gamma (configurable hotkey, default Alt+F1)
+- Revert to Default (configurable hotkey, default Alt+F2)
+- Configure Hotkeys... (change the global hotkeys)
 - Run at Startup (toggleable)
 - Apply to Monitor (submenu with all detected monitors)
   - All Monitors (applies to every detected monitor)
@@ -66,17 +67,18 @@ When moving or sharing the application, ensure these files stay together:
 - HDRGammaFix.pdb
 - scripts/dispwin.exe
 - scripts/lut.cal
-- scripts/srgb-to-gamma.bat
-- scripts/revert.bat
 - Resources/DefaultIcon.ico
 - Resources/GammaIcon.ico
+
+> The `.bat` files in `scripts/` are kept for reference/documentation only; the app invokes `dispwin.exe` directly.
 
 ## Usage
 
 ### Basic Operation
 - **Left-click** the tray icon to toggle between profiles
-- Use **Alt+F1** to apply the gamma-corrected profile
-- Use **Alt+F2** to revert to the default Windows profile
+- Use **Alt+F1** (configurable) to apply the gamma-corrected profile
+- Use **Alt+F2** (configurable) to revert to the default Windows profile
+- Change hotkeys via **Configure Hotkeys...** in the right-click menu
 - **Right-click** for additional options and settings
 
 ### Multi-Monitor Setup

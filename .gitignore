@@ -38,6 +38,7 @@ packages/
 
 ## Publish output
 publish/
+publish-framework-dependent/
 
 ## Local history
 .localhistory/
