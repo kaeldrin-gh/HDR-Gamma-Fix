@@ -114,3 +114,7 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - Based on the research and color profile work by [Dylan Raga](https://github.com/dylanraga)
 - Icons adapted from standard system resources for clarity
+
+## Third-Party Notices
+
+- `scripts/dispwin.exe` is part of [Argyll CMS](https://github.com/argyllcms/argyllcms) v3.1.0 by Graeme W. Gill, licensed under the [GNU Affero General Public License v3](https://www.gnu.org/licenses/agpl-3.0.html). This project bundles it unmodified; you may obtain the corresponding source from the upstream repository. The full license text is available in `AGPL-3.0.txt`.
