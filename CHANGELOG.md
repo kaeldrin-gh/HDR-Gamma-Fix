@@ -13,12 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Assembly Version Metadata**: Executable now reports version 1.2.0 in file properties.
 
 ### Changed
+- **Sticky Monitor Selection**: A monitor that is temporarily disconnected is no longer dropped from the selection. It stays selected (shown as "not connected" in the menu), apply/revert become no-ops while it is away, and the profile is reapplied automatically once it comes back.
+- **Clearer Monitor Labels**: The "Apply to Monitor" entries now include resolution and the monitor's EDID id, e.g. `Monitor 1 - 2560x1440 [XMI27B2] (Primary)`, so a monitor stays recognisable even when Windows renumbers it.
 - **Async Profile Execution**: dispwin.exe now runs asynchronously so the tray UI and timers stay responsive instead of freezing up to 10 seconds per monitor.
 - **Direct dispwin.exe Invocation**: Profiles are applied by calling `scripts/dispwin.exe` directly, removing the intermediate `cmd.exe`/batch-file hop. The `.bat` scripts remain in the distribution for reference but are no longer executed.
 - **Watchdog Efficiency**: The settings watchdog timer only runs while the gamma profile is active, instead of polling `SystemSettings.exe` every second while idle in the default state.
 - **Higher-DPI Rendering**: Switched from `SystemAware` to `PerMonitorV2` DPI handling for sharper rendering on mixed-DPI setups.
 
 ### Fixed
+- **Stale Monitor List**: The monitor list was detected once at startup and never refreshed, so disconnecting a monitor or switching between extended/single-display mode left the app targeting a display that no longer existed - Apply/Revert would silently do nothing until the app was restarted. The list is now re-detected whenever Windows reports a display change, and again (throttled) when the tray menu is opened.
+- **Monitor Selection Following the Wrong Display**: A saved "Apply to Monitor" choice was stored as a display index, which is just a position in dispwin's list of currently attached displays. Enabling or disabling a monitor renumbered that list, so the profile silently jumped to a different physical monitor. The selection is now keyed on the monitor's stable Windows hardware ID (EDID-derived), so it stays locked to the same panel across topology changes and reboots.
+- **Wrong Monitor During Display Transitions**: The target display index was resolved when the display-change event arrived, but dispwin.exe only ran ~1.5s later, by which point Windows may have renumbered the displays. Monitors are now re-detected immediately before each apply/revert so the index can't go stale.
 - **Overlapping Launch Guard**: Rapid hotkey/menu presses can no longer start concurrent dispwin.exe processes; the operation in progress wins and subsequent requests are ignored.
 - **Hung Process Cleanup**: If dispwin.exe fails to exit within the timeout, it is now killed instead of being left running in the background.
 - **Silent Failures**: Previously empty `catch` blocks (monitor detection, registry load/save, process checks) now log diagnostics for easier troubleshooting.
