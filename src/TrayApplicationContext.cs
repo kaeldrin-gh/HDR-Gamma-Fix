@@ -66,7 +66,12 @@ namespace SystemTrayApp
 
         // --- Monitor Selection ---
         private List<MonitorInfo> _availableMonitors = new List<MonitorInfo>();
-        private int _selectedMonitorIndex = -1; // -1 means all monitors, 0+ means specific monitor
+        private string? _selectedMonitorKey;     // Stable HardwareId of the selected monitor (null = All Monitors). Source of truth for "which monitor".
+        private string? _selectedMonitorLastKnownName; // Remembered display name, shown even while the monitor is disconnected
+        private ToolStripMenuItem? _monitorMenuItem; // "Apply to Monitor" submenu, rebuilt when the monitor list changes
+        private bool _isRefreshingMonitors; // Reentrancy guard against overlapping refreshes
+        private DateTime _lastMonitorRefreshUtc = DateTime.MinValue;
+        private static readonly TimeSpan MonitorRefreshMinInterval = TimeSpan.FromSeconds(2);
         
         // --- Notification Settings ---
         private bool _notificationsEnabled = true; // Default to enabled, loaded from registry
@@ -74,24 +79,60 @@ namespace SystemTrayApp
         // Monitor information structure
         public struct MonitorInfo
         {
+            // dispwin's current "-d N" index. Volatile: it is just a position in dispwin's list of
+            // *currently attached* displays, so it shifts as monitors are enabled/disabled.
             public int DisplayNumber;
+
+            // Windows GDI adapter name (e.g. "DISPLAY6"). Also volatile: on hybrid-GPU laptops the
+            // same physical panel can attach under any of several adapter slots, so this must not be
+            // used as a persistent identity - only to correlate dispwin's list with Windows'.
+            public string AdapterName;
+
+            // Stable per-monitor identity from Windows, e.g.
+            // "MONITOR\XMI27B2\{4d36e96e-...}\0013". Survives unplugging, display-mode changes and
+            // reboots, so this is what a saved monitor selection is keyed on.
+            public string HardwareId;
+
             public string DisplayName;
             public bool IsWorking;
-            
-            public MonitorInfo(int displayNumber, string displayName, bool isWorking)
+
+            public MonitorInfo(int displayNumber, string adapterName, string hardwareId, string displayName, bool isWorking)
             {
                 DisplayNumber = displayNumber;
+                AdapterName = adapterName;
+                HardwareId = hardwareId;
                 DisplayName = displayName;
                 IsWorking = isWorking;
             }
         }
+
+        // --- Win32 display enumeration (used to obtain stable per-monitor hardware IDs) ---
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DISPLAY_DEVICE
+        {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceKey;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+
+        private const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
 
         public TrayApplicationContext()
         {
             InitializeNotificationTimer(); // Initialize the notification timer first
             InitializeProfileRecoveryTimer();
             InitializeSettingsWatchdogTimer();
-            DetectAvailableMonitors(); // Detect monitors
+            _availableMonitors = DetectMonitors(); // Detect monitors
             LoadMonitorSelection(); // Load user's monitor preference
             LoadNotificationSetting(); // Load user's notification preference
             LoadHotkeySettings(); // Load user's hotkey preference
@@ -107,6 +148,17 @@ namespace SystemTrayApp
         {
             // Create the context menu with our options
             _contextMenu = new ContextMenuStrip();
+
+            // Safety net: re-check the connected monitors when the tray menu is opened, in case
+            // a display topology change was missed by the system event handlers. Throttled so
+            // rapid repeated clicks don't repeatedly spawn dispwin.exe just to detect displays.
+            _contextMenu.Opening += (s, e) => {
+                if (DateTime.UtcNow - _lastMonitorRefreshUtc < MonitorRefreshMinInterval)
+                {
+                    return;
+                }
+                RefreshAvailableMonitors(showNotificationOnChange: false);
+            };
 
             // Add our action buttons
             _applyMenuItem = new ToolStripMenuItem(
@@ -343,6 +395,7 @@ namespace SystemTrayApp
 
         private void OnDisplaySettingsChanged(object? sender, EventArgs e)
         {
+            RunOnUiThread(() => RefreshAvailableMonitors(showNotificationOnChange: true));
             ScheduleProfileRecovery("Windows display settings changed.");
         }
 
@@ -416,18 +469,73 @@ namespace SystemTrayApp
         }
 
         // --- Monitor Detection and Management ---
-        private void DetectAvailableMonitors()
+
+        /// <summary>
+        /// Maps each currently attached GDI adapter name (e.g. "DISPLAY6") to the stable hardware ID
+        /// and description of the physical monitor plugged into it. Used to give dispwin's volatile
+        /// display indices a persistent identity.
+        /// </summary>
+        private static Dictionary<string, (string HardwareId, string Description)> GetAttachedMonitorsByAdapter()
         {
-            _availableMonitors.Clear();
-            
-            // Try to detect monitors using dispwin.exe help output
+            var map = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                for (uint i = 0; ; i++)
+                {
+                    var adapter = new DISPLAY_DEVICE();
+                    adapter.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
+                    if (!EnumDisplayDevices(null, i, ref adapter, 0))
+                    {
+                        break;
+                    }
+
+                    if ((adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0)
+                    {
+                        continue; // Not part of the desktop right now, so dispwin won't list it either
+                    }
+
+                    var monitor = new DISPLAY_DEVICE();
+                    monitor.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
+                    if (!EnumDisplayDevices(adapter.DeviceName, 0, ref monitor, 0))
+                    {
+                        continue;
+                    }
+
+                    // dispwin reports the adapter name without the "\\.\" prefix
+                    string adapterName = adapter.DeviceName.StartsWith(@"\\.\", StringComparison.Ordinal)
+                        ? adapter.DeviceName.Substring(4)
+                        : adapter.DeviceName;
+
+                    map[adapterName] = (monitor.DeviceID, monitor.DeviceString);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error enumerating display devices: {ex}");
+            }
+
+            return map;
+        }
+
+        /// <summary>
+        /// Detects the currently attached monitors by asking dispwin for its display list and pairing
+        /// each entry with the stable hardware ID Windows reports for that adapter.
+        /// Returns a new list and touches no shared state, so it is safe to call from a background thread.
+        /// </summary>
+        private List<MonitorInfo> DetectMonitors()
+        {
+            var monitors = new List<MonitorInfo>();
+
             string dispwinPath = FindDispwinExecutable();
             if (string.IsNullOrEmpty(dispwinPath))
             {
                 // Fallback: assume at least one monitor
-                _availableMonitors.Add(new MonitorInfo(1, "Primary Monitor", true));
-                return;
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "PRIMARY", "Primary Monitor", true));
+                return monitors;
             }
+
+            var adapterMap = GetAttachedMonitorsByAdapter();
 
             // Parse dispwin help output to get actual monitor list
             try
@@ -448,10 +556,10 @@ namespace SystemTrayApp
                     string output = process.StandardOutput.ReadToEnd();
                     string errorOutput = process.StandardError.ReadToEnd();
                     process.WaitForExit(5000);
-                    
+
                     // Parse both stdout and stderr for display information
                     string fullOutput = output + errorOutput;
-                    ParseMonitorsFromDispwinOutput(fullOutput);
+                    monitors.AddRange(ParseMonitorsFromDispwinOutput(fullOutput, adapterMap));
                 }
             }
             catch (Exception ex)
@@ -459,48 +567,104 @@ namespace SystemTrayApp
                 // If parsing fails, fall back to single monitor
                 Debug.WriteLine($"Error detecting monitors via dispwin: {ex}");
             }
-            
+
             // If no monitors detected, add primary as fallback
-            if (_availableMonitors.Count == 0)
+            if (monitors.Count == 0)
             {
-                _availableMonitors.Add(new MonitorInfo(1, "Primary Monitor", true));
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "PRIMARY", "Primary Monitor", true));
             }
+
+            return monitors;
         }
-        
-        private void ParseMonitorsFromDispwinOutput(string output)
+
+        /// <summary>
+        /// Pulls the EDID identifier out of a Windows monitor hardware ID, e.g.
+        /// "MONITOR\XMI27B2\{4d36e96e-...}\0013" -> "XMI27B2". Returns "" if it isn't in that form.
+        /// </summary>
+        private static string GetEdidCode(string hardwareId)
         {
-            // Look for lines like: "    1 = 'DISPLAY1, at 0, 0, width 2560, height 1440 (Primary Display)'"
+            if (string.IsNullOrEmpty(hardwareId) || !hardwareId.StartsWith(@"MONITOR\", StringComparison.OrdinalIgnoreCase))
+            {
+                return "";
+            }
+
+            string[] parts = hardwareId.Split('\\');
+            return parts.Length > 1 ? parts[1] : "";
+        }
+
+        private static List<MonitorInfo> ParseMonitorsFromDispwinOutput(
+            string output,
+            Dictionary<string, (string HardwareId, string Description)> adapterMap)
+        {
+            var monitors = new List<MonitorInfo>();
+
+            // Look for lines like: "    1 = 'DISPLAY6, at 0, 0, width 2560, height 1440 (Primary Display)'"
             string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            
+
             foreach (string line in lines)
             {
                 // Match lines that start with spaces, then a number, then " = '"
-                if (Regex.IsMatch(line.Trim(), @"^\d+\s*=\s*'.*'"))
+                if (!Regex.IsMatch(line.Trim(), @"^\d+\s*=\s*'.*'"))
                 {
-                    try
+                    continue;
+                }
+
+                try
+                {
+                    // Extract monitor number and description
+                    var match = Regex.Match(line.Trim(), @"^(\d+)\s*=\s*'([^']+)'");
+                    if (!match.Success)
                     {
-                        // Extract monitor number and description
-                        var match = Regex.Match(line.Trim(), @"^(\d+)\s*=\s*'([^']+)'");
-                        if (match.Success)
-                        {
-                            int monitorNum = int.Parse(match.Groups[1].Value);
-                            string description = match.Groups[2].Value;
-                            
-                            // Create a cleaner display name
-                            string displayName = $"Monitor {monitorNum}";
-                            if (description.Contains("Primary"))
-                                displayName += " (Primary)";
-                            
-                            _availableMonitors.Add(new MonitorInfo(monitorNum, displayName, true));
-                        }
+                        continue;
                     }
-                    catch (Exception ex)
+
+                    int monitorNum = int.Parse(match.Groups[1].Value);
+                    string description = match.Groups[2].Value;
+
+                    // Leading token is the GDI adapter name, e.g. "DISPLAY6"
+                    string adapterName = description.Split(',')[0].Trim();
+                    if (string.IsNullOrEmpty(adapterName))
                     {
-                        // Skip malformed lines
-                        Debug.WriteLine($"Skipping malformed monitor line: {ex.Message}");
+                        adapterName = description.Trim();
                     }
+
+                    // Prefer the monitor's stable hardware ID. If Windows didn't report one, fall back
+                    // to the adapter name so the selection still works for the current session.
+                    string hardwareId = adapterMap.TryGetValue(adapterName, out var info) && !string.IsNullOrEmpty(info.HardwareId)
+                        ? info.HardwareId
+                        : adapterName;
+
+                    // Build a name that helps tell monitors apart even as their index shifts, e.g.
+                    // "Monitor 1 - 2560x1440 [XMI27B2] (Primary)". The bracketed token is the
+                    // monitor's EDID id, which stays with the physical panel.
+                    string displayName = $"Monitor {monitorNum}";
+                    var sizeMatch = Regex.Match(description, @"width\s+(\d+),\s*height\s+(\d+)");
+                    if (sizeMatch.Success)
+                    {
+                        displayName += $" - {sizeMatch.Groups[1].Value}x{sizeMatch.Groups[2].Value}";
+                    }
+
+                    string edidCode = GetEdidCode(hardwareId);
+                    if (!string.IsNullOrEmpty(edidCode))
+                    {
+                        displayName += $" [{edidCode}]";
+                    }
+
+                    if (description.Contains("Primary"))
+                    {
+                        displayName += " (Primary)";
+                    }
+
+                    monitors.Add(new MonitorInfo(monitorNum, adapterName, hardwareId, displayName, true));
+                }
+                catch (Exception ex)
+                {
+                    // Skip malformed lines
+                    Debug.WriteLine($"Skipping malformed monitor line: {ex.Message}");
                 }
             }
+
+            return monitors;
         }
         
         
@@ -521,20 +685,45 @@ namespace SystemTrayApp
             {
                 using RegistryKey? key = Registry.CurrentUser.OpenSubKey(
                     RegistryKeyPath, false);
-                
-                if (key?.GetValue("SelectedMonitor") is int selectedMonitor)
+
+                string? savedId = key?.GetValue("SelectedMonitorId") as string;
+
+                if (!string.IsNullOrEmpty(savedId))
                 {
-                    _selectedMonitorIndex = selectedMonitor;
+                    _selectedMonitorKey = savedId;
+                    _selectedMonitorLastKnownName = key?.GetValue("SelectedMonitorName") as string;
+
+                    // Refresh the name if this monitor is currently connected, so a monitor that was
+                    // renamed/renumbered still shows sensibly. If it isn't connected we keep the
+                    // remembered name and simply wait for it to come back.
+                    var match = _availableMonitors.FirstOrDefault(m => m.HardwareId == savedId);
+                    if (match.HardwareId != null)
+                    {
+                        _selectedMonitorLastKnownName = match.DisplayName;
+                    }
+                    return;
                 }
-                else
+
+                // Migration: older versions stored only a volatile display index. Best-effort map it
+                // onto whichever monitor currently sits at that index, then persist the stable ID.
+                if (key?.GetValue("SelectedMonitor") is int savedIndex && savedIndex > 0)
                 {
-                    _selectedMonitorIndex = -1; // Default to all monitors
+                    var match = _availableMonitors.FirstOrDefault(m => m.DisplayNumber == savedIndex);
+                    if (match.HardwareId != null)
+                    {
+                        SaveMonitorSelection(match.HardwareId, match.DisplayName);
+                        return;
+                    }
                 }
+
+                _selectedMonitorKey = null;
+                _selectedMonitorLastKnownName = null;
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error loading monitor selection: {ex}");
-                _selectedMonitorIndex = -1; // Default to all monitors on error
+                _selectedMonitorKey = null;
+                _selectedMonitorLastKnownName = null; // Default to all monitors on error
             }
         }
         
@@ -561,13 +750,36 @@ namespace SystemTrayApp
             }
         }
         
-        private void SaveMonitorSelection(int monitorIndex)
+        /// <summary>
+        /// Persists which monitor should receive the profile. Pass null to select "All Monitors";
+        /// otherwise pass the monitor's stable HardwareId, so the selection keeps pointing at the same
+        /// physical monitor even when Windows renumbers displays or the monitor is unplugged and
+        /// reconnected.
+        /// </summary>
+        private void SaveMonitorSelection(string? monitorId, string? monitorName)
         {
+            _selectedMonitorKey = monitorId;
+            _selectedMonitorLastKnownName = monitorName;
+
             try
             {
                 using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
-                key?.SetValue("SelectedMonitor", monitorIndex);
-                _selectedMonitorIndex = monitorIndex;
+
+                if (monitorId != null)
+                {
+                    key?.SetValue("SelectedMonitorId", monitorId);
+                    key?.SetValue("SelectedMonitorName", monitorName ?? string.Empty);
+                }
+                else
+                {
+                    key?.DeleteValue("SelectedMonitorId", false);
+                    key?.DeleteValue("SelectedMonitorName", false);
+                }
+
+                // No longer used for identity, but cleared so an older build can't resurrect a
+                // stale index-based selection.
+                key?.DeleteValue("SelectedMonitor", false);
+                key?.DeleteValue("SelectedMonitorKey", false);
             }
             catch (Exception ex)
             {
@@ -698,72 +910,183 @@ namespace SystemTrayApp
         
         private void AddMonitorSelectionMenu()
         {
-            if (_availableMonitors.Count == 0)
-            {
-                // No monitors detected, skip adding menu
-                return;
-            }
-            
-            var monitorMenuItem = new ToolStripMenuItem("Apply to Monitor");
-            
+            _monitorMenuItem = new ToolStripMenuItem("Apply to Monitor");
+            BuildMonitorMenuItems(_monitorMenuItem);
+            _contextMenu.Items.Add(_monitorMenuItem);
+        }
+
+        /// <summary>
+        /// (Re)builds the "Apply to Monitor" submenu contents from the current
+        /// _availableMonitors list. Safe to call repeatedly after the monitor list changes.
+        /// </summary>
+        private void BuildMonitorMenuItems(ToolStripMenuItem monitorMenuItem)
+        {
+            monitorMenuItem.DropDownItems.Clear();
+
             // Add "All Monitors" option
             var allMonitorsItem = new ToolStripMenuItem("All Monitors");
-            allMonitorsItem.Checked = (_selectedMonitorIndex == -1);
+            allMonitorsItem.Checked = (_selectedMonitorKey == null);
             allMonitorsItem.Click += (s, e) => {
-                SaveMonitorSelection(-1);
+                SaveMonitorSelection(null, null);
                 RefreshMonitorMenu();
                 UpdateIconAndText();
             };
             monitorMenuItem.DropDownItems.Add(allMonitorsItem);
-            
+
             // Add separator
             monitorMenuItem.DropDownItems.Add(new ToolStripSeparator());
-            
+
             // Add individual monitor options
+            bool selectedMonitorCurrentlyConnected = false;
             foreach (var monitor in _availableMonitors)
             {
+                var capturedMonitor = monitor; // per-iteration copy for the closure below
+                bool isSelected = _selectedMonitorKey != null && _selectedMonitorKey == monitor.HardwareId;
+                if (isSelected)
+                {
+                    selectedMonitorCurrentlyConnected = true;
+                }
+
                 var monitorItem = new ToolStripMenuItem(monitor.DisplayName);
-                monitorItem.Checked = (_selectedMonitorIndex == monitor.DisplayNumber);
-                monitorItem.Tag = monitor.DisplayNumber;
+                monitorItem.Checked = isSelected;
+                monitorItem.Tag = monitor.HardwareId;
                 monitorItem.Click += (s, e) => {
-                    if (s is ToolStripMenuItem item && item.Tag is int displayNum)
-                    {
-                        SaveMonitorSelection(displayNum);
-                        RefreshMonitorMenu();
-                        UpdateIconAndText();
-                    }
+                    SaveMonitorSelection(capturedMonitor.HardwareId, capturedMonitor.DisplayName);
+                    RefreshMonitorMenu();
+                    UpdateIconAndText();
                 };
                 monitorMenuItem.DropDownItems.Add(monitorItem);
             }
-            
-            _contextMenu.Items.Add(monitorMenuItem);
+
+            // A specific monitor is selected but not currently connected: keep it visible (and
+            // remembered) instead of silently reverting to "All Monitors", so the user can see the
+            // app is still targeting it and will resume automatically once it reconnects.
+            if (_selectedMonitorKey != null && !selectedMonitorCurrentlyConnected)
+            {
+                string rememberedName = _selectedMonitorLastKnownName ?? "Selected Monitor";
+                monitorMenuItem.DropDownItems.Add(new ToolStripMenuItem($"{rememberedName} (not connected)")
+                {
+                    Checked = true,
+                    Enabled = false
+                });
+            }
         }
-        
+
         private void RefreshMonitorMenu()
         {
-            // Find and update the monitor menu items
-            foreach (ToolStripItem item in _contextMenu.Items)
+            if (_monitorMenuItem == null)
             {
-                if (item is ToolStripMenuItem menuItem && menuItem.Text == "Apply to Monitor")
+                return;
+            }
+
+            // A full rebuild is needed rather than just re-checking items, because the
+            // "(not connected)" placeholder may have to appear or disappear. This is often called
+            // from a menu item's own Click handler though, so defer it - mutating the dropdown's
+            // items while the ToolStrip is still dispatching that click is asking for trouble.
+            if (_messageHandler != null && !_messageHandler.IsDisposed && _messageHandler.IsHandleCreated)
+            {
+                _messageHandler.BeginInvoke(new Action(() =>
                 {
-                    // Update all submenu items
-                    foreach (ToolStripItem subItem in menuItem.DropDownItems)
+                    if (_monitorMenuItem != null)
                     {
-                        if (subItem is ToolStripMenuItem subMenuItem)
-                        {
-                            if (subMenuItem.Text == "All Monitors")
-                            {
-                                subMenuItem.Checked = (_selectedMonitorIndex == -1);
-                            }
-                            else if (subMenuItem.Tag is int displayNum)
-                            {
-                                subMenuItem.Checked = (_selectedMonitorIndex == displayNum);
-                            }
-                        }
+                        BuildMonitorMenuItems(_monitorMenuItem);
                     }
-                    break;
+                }));
+                return;
+            }
+
+            BuildMonitorMenuItems(_monitorMenuItem);
+        }
+
+        /// <summary>
+        /// Re-detects the connected monitors (e.g. after a display topology change such as
+        /// unplugging a monitor or switching from extended to single-display mode) and rebuilds
+        /// the "Apply to Monitor" submenu to match.
+        ///
+        /// The selection is sticky: it's remembered by the monitor's stable HardwareId rather than
+        /// its dispwin index or adapter name, both of which shift when the display topology changes.
+        /// If the selected monitor is temporarily disconnected, the selection is kept as-is (not
+        /// reset to "All Monitors") so the profile automatically resumes targeting it once it
+        /// reconnects. Must be called on the UI thread.
+        /// </summary>
+        private void RefreshAvailableMonitors(bool showNotificationOnChange)
+        {
+            if (_isRefreshingMonitors)
+            {
+                return;
+            }
+
+            _isRefreshingMonitors = true;
+            try
+            {
+                _lastMonitorRefreshUtc = DateTime.UtcNow;
+                ApplyDetectedMonitors(DetectMonitors(), showNotificationOnChange);
+            }
+            finally
+            {
+                _isRefreshingMonitors = false;
+            }
+        }
+
+        /// <summary>
+        /// Adopts a freshly detected monitor list, keeping the sticky selection pointed at the same
+        /// physical monitor and refreshing the tray menu/tooltip if anything changed.
+        /// Must be called on the UI thread.
+        /// </summary>
+        private void ApplyDetectedMonitors(List<MonitorInfo> detectedMonitors, bool showNotificationOnChange)
+        {
+            // Include the index and label in the signature, so the menu is also refreshed when the
+            // same set of monitors is merely renumbered or relabelled (e.g. primary display moved).
+            static IEnumerable<string> Signature(IEnumerable<MonitorInfo> monitors) =>
+                monitors.Select(m => $"{m.HardwareId}|{m.DisplayNumber}|{m.DisplayName}");
+
+            var previousSignature = Signature(_availableMonitors).ToList();
+            bool wasSelectedMonitorConnected = _selectedMonitorKey != null
+                && _availableMonitors.Any(m => m.HardwareId == _selectedMonitorKey);
+
+            _availableMonitors = detectedMonitors;
+
+            bool monitorsChanged = !previousSignature.SequenceEqual(Signature(_availableMonitors));
+
+            if (_selectedMonitorKey != null)
+            {
+                var match = _availableMonitors.FirstOrDefault(m => m.HardwareId == _selectedMonitorKey);
+                bool isSelectedMonitorConnected = match.HardwareId != null;
+
+                if (isSelectedMonitorConnected)
+                {
+                    // Same physical monitor, but its label may have changed (e.g. it became primary).
+                    if (match.DisplayName != _selectedMonitorLastKnownName)
+                    {
+                        SaveMonitorSelection(match.HardwareId, match.DisplayName);
+                    }
+
+                    if (showNotificationOnChange && !wasSelectedMonitorConnected)
+                    {
+                        QueueBalloonTip("Monitor Reconnected",
+                                      $"{match.DisplayName} is connected again. HDR Gamma Fix will keep targeting it.",
+                                      ToolTipIcon.Info);
+                    }
+                }
+                else if (showNotificationOnChange && wasSelectedMonitorConnected)
+                {
+                    QueueBalloonTip("Monitor Disconnected",
+                                  $"{_selectedMonitorLastKnownName ?? "The selected monitor"} is no longer connected. HDR Gamma Fix will resume automatically once it reconnects.",
+                                  ToolTipIcon.Warning);
                 }
             }
+
+            if (!monitorsChanged)
+            {
+                return;
+            }
+
+            if (_monitorMenuItem != null)
+            {
+                BuildMonitorMenuItems(_monitorMenuItem);
+            }
+
+            UpdateIconAndText();
         }
 
 
@@ -829,6 +1152,7 @@ namespace SystemTrayApp
 
         private void OnDisplayConfigurationChanged()
         {
+            RunOnUiThread(() => RefreshAvailableMonitors(showNotificationOnChange: true));
             ScheduleProfileRecovery("Windows refreshed the display configuration.");
         }
 
@@ -912,18 +1236,19 @@ namespace SystemTrayApp
         
         private string GetMonitorDisplayText()
         {
-            if (_selectedMonitorIndex == -1)
+            if (_selectedMonitorKey == null)
             {
                 return " (All Monitors)";
             }
-            
-            var selectedMonitor = _availableMonitors.FirstOrDefault(m => m.DisplayNumber == _selectedMonitorIndex);
-            if (selectedMonitor.DisplayNumber > 0)
+
+            var selectedMonitor = _availableMonitors.FirstOrDefault(m => m.HardwareId == _selectedMonitorKey);
+            if (selectedMonitor.HardwareId != null)
             {
                 return $" ({selectedMonitor.DisplayName})";
             }
-            
-            return "";
+
+            // Selected monitor is remembered but not currently connected
+            return $" ({_selectedMonitorLastKnownName ?? "Selected Monitor"} - not connected)";
         }
 
         private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
@@ -938,13 +1263,23 @@ namespace SystemTrayApp
             {
                 SuppressProfileRecoveryEvents();
 
-                if (await ExecuteBatchFileAsync("srgb-to-gamma.bat"))
+                var result = await ExecuteBatchFileAsync("srgb-to-gamma.bat");
+                if (result != ApplyResult.Failed)
                 {
                     _settingsWatchdogTimer.Start();
                     _isDefaultProfile = false;
                     UpdateIconAndText();
 
-                    if (isAutomaticRecovery)
+                    if (result == ApplyResult.MonitorNotConnected)
+                    {
+                        if (showNotification)
+                        {
+                            QueueBalloonTip("Monitor Not Connected",
+                                          $"{_selectedMonitorLastKnownName ?? "The selected monitor"} isn't connected right now. HDR Gamma Fix will apply the profile automatically once it reconnects.",
+                                          ToolTipIcon.Info);
+                        }
+                    }
+                    else if (isAutomaticRecovery)
                     {
                         if (showNotification)
                         {
@@ -986,18 +1321,28 @@ namespace SystemTrayApp
                 _wasSystemSettingsRunning = false;
                 _settingsWatchdogTimer.Stop(); // No need to watch settings while in default state
 
-                if (await ExecuteBatchFileAsync("revert.bat"))
+                var result = await ExecuteBatchFileAsync("revert.bat");
+                if (result != ApplyResult.Failed)
                 {
                     _isDefaultProfile = true;
                     UpdateIconAndText();
 
                     if (showNotification)
                     {
-                        // Queue the notification instead of showing immediately
-                        string monitorInfo = GetMonitorDisplayText();
-                        QueueBalloonTip("Profile Changed",
-                                      $"Reverted to Default profile{monitorInfo}",
-                                      ToolTipIcon.Info);
+                        if (result == ApplyResult.MonitorNotConnected)
+                        {
+                            QueueBalloonTip("Monitor Not Connected",
+                                          $"{_selectedMonitorLastKnownName ?? "The selected monitor"} isn't connected right now; nothing to revert.",
+                                          ToolTipIcon.Info);
+                        }
+                        else
+                        {
+                            // Queue the notification instead of showing immediately
+                            string monitorInfo = GetMonitorDisplayText();
+                            QueueBalloonTip("Profile Changed",
+                                          $"Reverted to Default profile{monitorInfo}",
+                                          ToolTipIcon.Info);
+                        }
                     }
                 }
             }
@@ -1011,29 +1356,48 @@ namespace SystemTrayApp
         private async void OnRevertToDefault(object? sender, EventArgs e) => await RevertToDefaultAsync();
 
 
-        private async Task<bool> ExecuteBatchFileAsync(string fileName)
+        // Outcome of trying to apply/revert the profile for the current monitor selection.
+        private enum ApplyResult
         {
-            // If "All Monitors" is selected (-1), apply to each monitor individually
-            if (_selectedMonitorIndex == -1)
+            Success,
+            MonitorNotConnected, // Selected monitor is currently disconnected; nothing to do, not an error
+            Failed
+        }
+
+        private async Task<ApplyResult> ExecuteBatchFileAsync(string fileName)
+        {
+            // Re-detect right before acting rather than trusting the cached list. Display change
+            // events fire while Windows is still settling the new topology, so a "-d N" index
+            // resolved when the event arrived can, by the time we actually run dispwin, refer to a
+            // completely different physical monitor.
+            var monitors = await Task.Run(DetectMonitors);
+            RunOnUiThread(() => ApplyDetectedMonitors(monitors, showNotificationOnChange: false));
+
+            // If "All Monitors" is selected, apply to each currently connected monitor
+            if (_selectedMonitorKey == null)
             {
                 bool success = true;
-                foreach (var monitor in _availableMonitors)
+                foreach (var monitor in monitors)
                 {
                     if (!await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber))
                     {
                         success = false;
                     }
                 }
-                return success;
+                return success ? ApplyResult.Success : ApplyResult.Failed;
             }
-            // If a specific monitor is selected, use monitor-specific execution
-            else if (_selectedMonitorIndex > 0)
+
+            // A specific monitor is selected: only act on it if it's currently connected. If it
+            // isn't, this is not a failure - the selection is remembered and will be honored again
+            // once the monitor reconnects (see RefreshAvailableMonitors).
+            var monitorToUse = monitors.FirstOrDefault(m => m.HardwareId == _selectedMonitorKey);
+            if (monitorToUse.HardwareId == null)
             {
-                return await ExecuteBatchFileForMonitorAsync(fileName, _selectedMonitorIndex);
+                return ApplyResult.MonitorNotConnected;
             }
-            
-            // Invalid monitor index (should not normally reach here)
-            return false;
+
+            bool ok = await ExecuteBatchFileForMonitorAsync(fileName, monitorToUse.DisplayNumber);
+            return ok ? ApplyResult.Success : ApplyResult.Failed;
         }
         
         private async Task<bool> ExecuteBatchFileForMonitorAsync(string fileName, int monitorIndex)
