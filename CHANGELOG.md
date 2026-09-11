@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-11
+
+### Changed
+- Monitor detection no longer blocks the UI thread, so opening the tray menu or a display
+  topology change can't freeze the app while `dispwin.exe` starts.
+- Failures while applying/reverting on "All Monitors" now mark the profile as partially
+  applied instead of silently leaving the app in the default state.
+- Background apply/revert failures notify via balloon tip instead of intrusive modal dialogs.
+
+### Fixed
+- `dispwin.exe` monitor detection can no longer deadlock on its output pipes, and a hung
+  helper process is terminated instead of being orphaned.
+- The "session ending" suppression now expires, so a shutdown cancelled by another app can't
+  leave the hotkeys and automatic recovery permanently disabled.
+- Holding down a hotkey no longer queues repeated toggles (`MOD_NOREPEAT`).
+- The hotkey configuration dialog now scales with the system font on high-DPI displays.
+- Reverting a profile no longer stops the settings watchdog if the revert itself fails.
+
 ## [1.2.1] - 2026-08-28
 
 ### Changed

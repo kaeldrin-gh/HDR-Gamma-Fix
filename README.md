@@ -52,7 +52,7 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 ## Requirements
 
 - Windows 10/11 with HDR capability
-- .NET 9 Runtime
+- [.NET 9 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/9.0) — required for the framework-dependent release
 
 ## Installation
 
@@ -64,11 +64,12 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 ### Required Files for Distribution
 When moving or sharing the application, ensure these files stay together:
 - HDRGammaFix.exe
-- HDRGammaFix.pdb
 - scripts/dispwin.exe
 - scripts/lut.cal
 - Resources/DefaultIcon.ico
 - Resources/GammaIcon.ico
+
+`HDRGammaFix.pdb` (debug symbols) is optional and only needed when diagnosing crashes.
 
 > The `.bat` files in `scripts/` are kept for reference/documentation only; the app invokes `dispwin.exe` directly.
 
@@ -105,6 +106,10 @@ When moving or sharing the application, ensure these files stay together:
 - Verify all required files are present in the application folder
 - Ensure HDR is enabled in Windows Display Settings for the target monitor
 - Try applying to individual monitors if "All Monitors" isn't working
+
+### Settings Location
+All preferences (monitor selection, notifications, hotkeys, run at startup) are stored under
+`HKEY_CURRENT_USER\SOFTWARE\HDRGammaFix` and can be reset by deleting that key.
 
 ## License
 

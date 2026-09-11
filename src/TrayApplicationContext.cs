@@ -60,7 +60,13 @@ namespace SystemTrayApp
         private string? _pendingProfileRecoveryReason;
         private bool _pendingProfileRecoveryNotification;
         private bool _wasSystemSettingsRunning;
-        private bool _sessionEnding; // Suppresses dispwin launches once Windows shutdown/logoff begins
+
+        // Suppresses dispwin launches once Windows shutdown/logoff begins. Expressed as an expiry
+        // time rather than a permanent flag, because a shutdown can be cancelled by another app
+        // (e.g. an "unsaved changes" prompt) - the app must not stay disabled forever.
+        private DateTime _sessionEndingSuppressUntilUtc = DateTime.MinValue;
+        private static readonly TimeSpan SessionEndingSuppressWindow = TimeSpan.FromSeconds(30);
+        private bool IsSessionEnding => DateTime.UtcNow < _sessionEndingSuppressUntilUtc;
         private bool _isOperationInProgress; // Prevents overlapping dispwin.exe launches (e.g. rapid Alt+F1 presses)
         private Process? _activeDispwinProcess; // Track in-flight dispwin.exe so it can't be orphaned on exit
 
@@ -70,6 +76,8 @@ namespace SystemTrayApp
         private string? _selectedMonitorLastKnownName; // Remembered display name, shown even while the monitor is disconnected
         private ToolStripMenuItem? _monitorMenuItem; // "Apply to Monitor" submenu, rebuilt when the monitor list changes
         private bool _isRefreshingMonitors; // Reentrancy guard against overlapping refreshes
+        private bool _monitorRefreshPending; // A refresh was requested while one was already running
+        private bool _pendingMonitorRefreshNotification;
         private DateTime _lastMonitorRefreshUtc = DateTime.MinValue;
         private static readonly TimeSpan MonitorRefreshMinInterval = TimeSpan.FromSeconds(2);
         
@@ -83,26 +91,18 @@ namespace SystemTrayApp
             // *currently attached* displays, so it shifts as monitors are enabled/disabled.
             public int DisplayNumber;
 
-            // Windows GDI adapter name (e.g. "DISPLAY6"). Also volatile: on hybrid-GPU laptops the
-            // same physical panel can attach under any of several adapter slots, so this must not be
-            // used as a persistent identity - only to correlate dispwin's list with Windows'.
-            public string AdapterName;
-
             // Stable per-monitor identity from Windows, e.g.
             // "MONITOR\XMI27B2\{4d36e96e-...}\0013". Survives unplugging, display-mode changes and
             // reboots, so this is what a saved monitor selection is keyed on.
             public string HardwareId;
 
             public string DisplayName;
-            public bool IsWorking;
 
-            public MonitorInfo(int displayNumber, string adapterName, string hardwareId, string displayName, bool isWorking)
+            public MonitorInfo(int displayNumber, string hardwareId, string displayName)
             {
                 DisplayNumber = displayNumber;
-                AdapterName = adapterName;
                 HardwareId = hardwareId;
                 DisplayName = displayName;
-                IsWorking = isWorking;
             }
         }
 
@@ -382,7 +382,7 @@ namespace SystemTrayApp
         {
             // Windows is shutting down or logging off. Launching dispwin.exe now would get it
             // killed mid-run and pop a "dispwin.exe stopped working" error, so stop everything.
-            _sessionEnding = true;
+            _sessionEndingSuppressUntilUtc = DateTime.UtcNow.Add(SessionEndingSuppressWindow);
 
             RunOnUiThread(() =>
             {
@@ -420,7 +420,7 @@ namespace SystemTrayApp
 
         private void ScheduleProfileRecovery(string reason, bool showNotification = true)
         {
-            if (_sessionEnding || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
+            if (IsSessionEnding || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
                 return;
             }
@@ -531,7 +531,7 @@ namespace SystemTrayApp
             if (string.IsNullOrEmpty(dispwinPath))
             {
                 // Fallback: assume at least one monitor
-                monitors.Add(new MonitorInfo(1, "PRIMARY", "PRIMARY", "Primary Monitor", true));
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor"));
                 return monitors;
             }
 
@@ -553,13 +553,32 @@ namespace SystemTrayApp
                 using Process? process = Process.Start(psi);
                 if (process != null)
                 {
-                    string output = process.StandardOutput.ReadToEnd();
-                    string errorOutput = process.StandardError.ReadToEnd();
-                    process.WaitForExit(5000);
+                    // Drain both pipes concurrently: dispwin prints its usage text to stderr, and
+                    // reading one pipe to the end while the other fills up can deadlock the child.
+                    Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+                    Task<string> errorTask = process.StandardError.ReadToEndAsync();
 
-                    // Parse both stdout and stderr for display information
-                    string fullOutput = output + errorOutput;
-                    monitors.AddRange(ParseMonitorsFromDispwinOutput(fullOutput, adapterMap));
+                    if (process.WaitForExit(5000))
+                    {
+                        // Parse both stdout and stderr for display information
+                        string fullOutput = outputTask.GetAwaiter().GetResult()
+                            + errorTask.GetAwaiter().GetResult();
+                        monitors.AddRange(ParseMonitorsFromDispwinOutput(fullOutput, adapterMap));
+                    }
+                    else
+                    {
+                        // Never leave a stuck helper process behind: once we stop tracking it,
+                        // an orphaned dispwin would keep running invisibly.
+                        Debug.WriteLine("dispwin.exe -? did not exit within 5 seconds; terminating it.");
+                        try
+                        {
+                            process.Kill();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Failed to terminate dispwin.exe -?: {ex}");
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -571,7 +590,7 @@ namespace SystemTrayApp
             // If no monitors detected, add primary as fallback
             if (monitors.Count == 0)
             {
-                monitors.Add(new MonitorInfo(1, "PRIMARY", "PRIMARY", "Primary Monitor", true));
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor"));
             }
 
             return monitors;
@@ -655,7 +674,7 @@ namespace SystemTrayApp
                         displayName += " (Primary)";
                     }
 
-                    monitors.Add(new MonitorInfo(monitorNum, adapterName, hardwareId, displayName, true));
+                    monitors.Add(new MonitorInfo(monitorNum, hardwareId, displayName));
                 }
                 catch (Exception ex)
                 {
@@ -878,17 +897,17 @@ namespace SystemTrayApp
             UnregisterHotkey(HOTKEY_ID_DEFAULT);
 
             bool gammaOk = _messageHandler != null && !_messageHandler.IsDisposed
-                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, newGammaModifiers, newGammaVk);
+                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, newGammaModifiers | HotkeySettings.MOD_NOREPEAT, newGammaVk);
             bool defaultOk = _messageHandler != null && !_messageHandler.IsDisposed
-                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, newDefaultModifiers, newDefaultVk);
+                && RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, newDefaultModifiers | HotkeySettings.MOD_NOREPEAT, newDefaultVk);
 
             if (!gammaOk || !defaultOk)
             {
                 // Roll back to the previous hotkeys
                 UnregisterHotkey(HOTKEY_ID_GAMMA);
                 UnregisterHotkey(HOTKEY_ID_DEFAULT);
-                RegisterHotKey(_messageHandler!.Handle, HOTKEY_ID_GAMMA, _gammaModifiers, _gammaVk);
-                RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers, _defaultVk);
+                RegisterHotKey(_messageHandler!.Handle, HOTKEY_ID_GAMMA, _gammaModifiers | HotkeySettings.MOD_NOREPEAT, _gammaVk);
+                RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers | HotkeySettings.MOD_NOREPEAT, _defaultVk);
 
                 QueueBalloonTip("Hotkey Registration Failed",
                               "The chosen hotkey could not be registered (it may be in use). Keeping the previous hotkeys.",
@@ -1009,10 +1028,14 @@ namespace SystemTrayApp
         /// reset to "All Monitors") so the profile automatically resumes targeting it once it
         /// reconnects. Must be called on the UI thread.
         /// </summary>
-        private void RefreshAvailableMonitors(bool showNotificationOnChange)
+        private async void RefreshAvailableMonitors(bool showNotificationOnChange)
         {
             if (_isRefreshingMonitors)
             {
+                // A refresh is already running. Coalesce this request instead of dropping it,
+                // otherwise a topology change arriving mid-detection could be missed entirely.
+                _monitorRefreshPending = true;
+                _pendingMonitorRefreshNotification |= showNotificationOnChange;
                 return;
             }
 
@@ -1020,11 +1043,39 @@ namespace SystemTrayApp
             try
             {
                 _lastMonitorRefreshUtc = DateTime.UtcNow;
-                ApplyDetectedMonitors(DetectMonitors(), showNotificationOnChange);
+
+                // Detect off the UI thread: launching dispwin.exe can take a moment (cold start,
+                // antivirus scan) and must not freeze the tray menu while it runs. The await
+                // resumes on the UI thread, so ApplyDetectedMonitors can safely touch the menu.
+                var monitors = await Task.Run(DetectMonitors);
+
+                if (IsSessionEnding)
+                {
+                    return; // Shutting down: don't touch the menu or queue notifications
+                }
+
+                ApplyDetectedMonitors(monitors, showNotificationOnChange);
+            }
+            catch (Exception ex)
+            {
+                // An escaped exception in an async void method would crash the app.
+                Debug.WriteLine($"Error refreshing monitors: {ex}");
             }
             finally
             {
                 _isRefreshingMonitors = false;
+
+                if (_monitorRefreshPending)
+                {
+                    bool showNotification = _pendingMonitorRefreshNotification;
+                    _monitorRefreshPending = false;
+                    _pendingMonitorRefreshNotification = false;
+
+                    if (!IsSessionEnding)
+                    {
+                        RefreshAvailableMonitors(showNotification);
+                    }
+                }
             }
         }
 
@@ -1097,7 +1148,7 @@ namespace SystemTrayApp
             _messageHandler.DisplayConfigurationChanged += OnDisplayConfigurationChanged;
             _messageHandler.SystemSettingChanged += OnSystemSettingChanged;
 
-            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, _gammaModifiers, _gammaVk))
+            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_GAMMA, _gammaModifiers | HotkeySettings.MOD_NOREPEAT, _gammaVk))
             {
                 // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
@@ -1105,7 +1156,7 @@ namespace SystemTrayApp
                               ToolTipIcon.Warning);
             }
 
-            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers, _defaultVk))
+            if (!RegisterHotKey(_messageHandler.Handle, HOTKEY_ID_DEFAULT, _defaultModifiers | HotkeySettings.MOD_NOREPEAT, _defaultVk))
             {
                  // Use the queue method for errors too - with null check
                 QueueBalloonTip("Hotkey Registration Failed",
@@ -1253,7 +1304,7 @@ namespace SystemTrayApp
 
         private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
         {
-            if (_sessionEnding || _isOperationInProgress)
+            if (IsSessionEnding || _isOperationInProgress)
             {
                 return;
             }
@@ -1277,6 +1328,15 @@ namespace SystemTrayApp
                             QueueBalloonTip("Monitor Not Connected",
                                           $"{_selectedMonitorLastKnownName ?? "The selected monitor"} isn't connected right now. HDR Gamma Fix will apply the profile automatically once it reconnects.",
                                           ToolTipIcon.Info);
+                        }
+                    }
+                    else if (result == ApplyResult.PartialSuccess)
+                    {
+                        if (showNotification)
+                        {
+                            QueueBalloonTip("Applied to Some Monitors",
+                                          "The profile was applied, but at least one monitor could not be updated.",
+                                          ToolTipIcon.Warning);
                         }
                     }
                     else if (isAutomaticRecovery)
@@ -1319,11 +1379,11 @@ namespace SystemTrayApp
                 _pendingProfileRecoveryReason = null;
                 _pendingProfileRecoveryNotification = false;
                 _wasSystemSettingsRunning = false;
-                _settingsWatchdogTimer.Stop(); // No need to watch settings while in default state
 
                 var result = await ExecuteBatchFileAsync("revert.bat");
                 if (result != ApplyResult.Failed)
                 {
+                    _settingsWatchdogTimer.Stop(); // No need to watch settings while in default state
                     _isDefaultProfile = true;
                     UpdateIconAndText();
 
@@ -1334,6 +1394,12 @@ namespace SystemTrayApp
                             QueueBalloonTip("Monitor Not Connected",
                                           $"{_selectedMonitorLastKnownName ?? "The selected monitor"} isn't connected right now; nothing to revert.",
                                           ToolTipIcon.Info);
+                        }
+                        else if (result == ApplyResult.PartialSuccess)
+                        {
+                            QueueBalloonTip("Reverted on Some Monitors",
+                                          "The default profile was restored on at least one monitor, but not all of them.",
+                                          ToolTipIcon.Warning);
                         }
                         else
                         {
@@ -1360,6 +1426,7 @@ namespace SystemTrayApp
         private enum ApplyResult
         {
             Success,
+            PartialSuccess,      // "All Monitors": at least one monitor was updated, but not all
             MonitorNotConnected, // Selected monitor is currently disconnected; nothing to do, not an error
             Failed
         }
@@ -1376,15 +1443,24 @@ namespace SystemTrayApp
             // If "All Monitors" is selected, apply to each currently connected monitor
             if (_selectedMonitorKey == null)
             {
-                bool success = true;
+                int succeeded = 0;
                 foreach (var monitor in monitors)
                 {
-                    if (!await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber))
+                    if (await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber))
                     {
-                        success = false;
+                        succeeded++;
                     }
                 }
-                return success ? ApplyResult.Success : ApplyResult.Failed;
+
+                if (succeeded == 0)
+                {
+                    return ApplyResult.Failed;
+                }
+
+                // Don't silently report failure when most monitors did work - that would leave the
+                // app thinking it's still in the default state and the next click would re-apply
+                // instead of reverting.
+                return succeeded == monitors.Count ? ApplyResult.Success : ApplyResult.PartialSuccess;
             }
 
             // A specific monitor is selected: only act on it if it's currently connected. If it
@@ -1408,8 +1484,9 @@ namespace SystemTrayApp
                 string dispwinPath = FindDispwinExecutable();
                 if (string.IsNullOrEmpty(dispwinPath))
                 {
-                    MessageBox.Show("Could not find dispwin.exe", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    QueueBalloonTip("Error", "Could not find dispwin.exe", ToolTipIcon.Error);
+                    // Notify instead of showing a modal dialog: this runs from background
+                    // recovery too, where a popup (repeated on every retry) would be intrusive.
+                    QueueBalloonTip("Error", "Could not find dispwin.exe. Reinstall the application to restore it.", ToolTipIcon.Error);
                     return false;
                 }
                 
@@ -1438,8 +1515,6 @@ namespace SystemTrayApp
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error executing monitor-specific command: {ex.Message}", "Error", 
-                               MessageBoxButtons.OK, MessageBoxIcon.Error);
                 QueueBalloonTip("Error", $"Error executing command: {ex.Message}", ToolTipIcon.Error);
                 Debug.WriteLine($"Error executing monitor-specific command: {ex}");
             }

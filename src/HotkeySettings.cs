@@ -15,6 +15,10 @@ namespace SystemTrayApp
         public const uint MOD_SHIFT = 0x0004;
         public const uint MOD_WIN = 0x0008;
 
+        // Registration-only flag: suppresses auto-repeat while the hotkey is held down.
+        // Not a modifier, so Format/TryParse deliberately ignore it.
+        public const uint MOD_NOREPEAT = 0x4000;
+
         public static readonly (string Name, uint Flags)[] ModifierOptions = new[]
         {
             ("Alt", MOD_ALT),

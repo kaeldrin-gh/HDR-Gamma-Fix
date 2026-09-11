@@ -31,8 +31,14 @@ namespace SystemTrayApp
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(360, 168);
+            ClientSize = new Size(360, 126);
             Font = SystemFonts.MessageBoxFont;
+
+            // Scale the fixed layout with the system font. The app opts into PerMonitorV2 DPI,
+            // and HDR displays often run at high scaling, so a purely pixel-based layout would
+            // otherwise render too small or clip.
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
 
             _gammaModifiers = new ComboBox();
             _gammaKeys = new ComboBox();
