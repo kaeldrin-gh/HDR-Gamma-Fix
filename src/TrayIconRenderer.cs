@@ -46,16 +46,7 @@ namespace SystemTrayApp
 
         public static Icon Create(TrayIconState state, int size, bool lightTaskbar)
         {
-            using var bitmap = new Bitmap(size, size);
-            using (var graphics = Graphics.FromImage(bitmap))
-            {
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                // Pixel i covers [i, i+1), so whole-number edges fall exactly on pixel boundaries
-                // (GDI+'s default centers pixels on whole numbers, smearing 1 px lines over two).
-                graphics.PixelOffsetMode = PixelOffsetMode.Half;
-                Draw(graphics, state, size, lightTaskbar ? OnLightTaskbar : OnDarkTaskbar);
-            }
-
+            using var bitmap = CreateBitmap(state, size, lightTaskbar);
             IntPtr handle = bitmap.GetHicon();
             try
             {
@@ -66,6 +57,22 @@ namespace SystemTrayApp
             {
                 DestroyIcon(handle);
             }
+        }
+
+        /// <summary>
+        /// Draws one icon image. Also used to build the .ico files in Resources (the exe's icon
+        /// and the fallback tray icons), so they match what the tray shows.
+        /// </summary>
+        public static Bitmap CreateBitmap(TrayIconState state, int size, bool lightTaskbar)
+        {
+            var bitmap = new Bitmap(size, size);
+            using var graphics = Graphics.FromImage(bitmap);
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            // Pixel i covers [i, i+1), so whole-number edges fall exactly on pixel boundaries
+            // (GDI+'s default centers pixels on whole numbers, smearing 1 px lines over two).
+            graphics.PixelOffsetMode = PixelOffsetMode.Half;
+            Draw(graphics, state, size, lightTaskbar ? OnLightTaskbar : OnDarkTaskbar);
+            return bitmap;
         }
 
         private static void Draw(Graphics graphics, TrayIconState state, int s, Color foreground)

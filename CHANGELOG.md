@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redesigned tray icons, drawn at the exact tray size so they stay sharp at any scaling. The "off"
   icon follows the taskbar theme (the old black one was nearly invisible on a dark taskbar), and a
   new "paused" icon shows when the fix is on but nothing is loaded (HDR off, or the selected
-  monitor disconnected).
+  monitor disconnected). The exe icon matches, with sharp images from 16 to 256 px (it was a
+  single 256 px image that Windows had to shrink).
 - README rewritten: tray icon states, menu reference, gamma curve settings, troubleshooting and
   uninstall steps.
 - The watchdog now reads the loaded gamma ramp back and reapplies only when Windows actually
