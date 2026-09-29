@@ -85,6 +85,11 @@ Native HDR games and videos don't have the washed-out problem, but the correctio
 - **No visible change:** make sure HDR is on for that monitor (the icon shows paused if it isn't) and that the right monitor is selected under **Apply to Monitor**.
 - **AMD graphics:** check that **Gamma Curve → GPU Method** is AMD. The AMD method follows the generator but has had less testing than NVIDIA.
 - **Colors look wrong with HDR off:** keep **Only Apply When HDR Is On** checked; the curve is designed for HDR mode.
+- **One app's window flickers while the fix is on (NVIDIA):** this mostly affects Chromium/Electron apps such as Chrome, Discord or Claude. It's caused by the loaded gamma curve itself, not by HDR Gamma Fix's activity: it happens with any curve loaded through `dispwin`, even with the app closed. The likely cause is the driver's multi-plane overlay (MPO) handling, where the window switches between rendering paths that apply the curve differently. In order of preference:
+  1. Update the NVIDIA driver.
+  2. Turn off hardware acceleration in the flickering app, if it has that setting.
+  3. Add the app under **Pause for Apps...**. It won't flicker while it's in front, but its SDR content looks washed out again there.
+  4. Disable MPO system-wide with NVIDIA's workaround: create the DWORD `OverlayTestMode` = `5` under `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Dwm` and reboot. Delete the value and reboot to undo. It may not take effect on the newest Windows 11 builds.
 - **Monitor missing from the menu:** open the menu again after connecting it (the list refreshes), and check that `scripts/dispwin.exe` is present.
 - **Hotkey doesn't work:** another app may already use it; pick another under **Configure Hotkeys...**
 
