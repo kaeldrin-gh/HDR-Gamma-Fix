@@ -86,6 +86,7 @@ namespace SystemTrayApp
         private const int ERROR_INSUFFICIENT_BUFFER = 122;
         private const int DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
         private const int DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO = 9;
+        private const int DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL = 11;
         private const int DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 = 15; // Windows 11 24H2+
         private const int DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR = 2;
 
@@ -175,6 +176,16 @@ namespace SystemTrayApp
             public int activeColorMode;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DISPLAYCONFIG_SDR_WHITE_LEVEL
+        {
+            public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+            public uint SDRWhiteLevel; // In units of 80 nits / 1000, i.e. 1000 = 80 nits
+        }
+
+        [DllImport("user32.dll")]
+        private static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SDR_WHITE_LEVEL requestPacket);
+
         [DllImport("user32.dll")]
         private static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPathArrayElements, out uint numModeInfoArrayElements);
 
@@ -192,12 +203,18 @@ namespace SystemTrayApp
         private static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 requestPacket);
 
         /// <summary>
-        /// Returns whether HDR is currently on for each active display. Displays whose state
-        /// couldn't be determined are left out, so callers can treat "missing" as "unknown".
+        /// Live color state of one display. Either value is null if Windows couldn't report it.
         /// </summary>
-        public static Dictionary<string, bool> GetHdrStateByAdapter()
+        public readonly record struct DisplayColorInfo(bool? IsHdr, double? SdrWhiteNits);
+
+        /// <summary>
+        /// Returns the HDR state and SDR white level ("SDR content brightness") of each active
+        /// display. Displays that couldn't be queried at all are left out, so callers can treat
+        /// "missing" as "unknown".
+        /// </summary>
+        public static Dictionary<string, DisplayColorInfo> GetColorInfoByAdapter()
         {
-            var result = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var result = new Dictionary<string, DisplayColorInfo>(StringComparer.OrdinalIgnoreCase);
 
             try
             {
@@ -238,7 +255,8 @@ namespace SystemTrayApp
                     }
 
                     bool? isHdr = QueryIsHdr(path.targetInfo.adapterId, path.targetInfo.id);
-                    if (isHdr == null)
+                    double? sdrWhiteNits = QuerySdrWhiteNits(path.targetInfo.adapterId, path.targetInfo.id);
+                    if (isHdr == null && sdrWhiteNits == null)
                     {
                         continue;
                     }
@@ -247,8 +265,14 @@ namespace SystemTrayApp
                         ? sourceName.viewGdiDeviceName.Substring(4)
                         : sourceName.viewGdiDeviceName;
 
-                    // A cloned desktop has several targets per source; it counts as HDR if any does.
-                    result[adapterName] = (result.TryGetValue(adapterName, out bool existing) && existing) || isHdr.Value;
+                    // A cloned desktop has several targets per source; it counts as HDR if any
+                    // does. The first target's white level wins, since one ramp serves them all.
+                    if (result.TryGetValue(adapterName, out var existing))
+                    {
+                        isHdr = existing.IsHdr == true || isHdr == true ? true : existing.IsHdr ?? isHdr;
+                        sdrWhiteNits = existing.SdrWhiteNits ?? sdrWhiteNits;
+                    }
+                    result[adapterName] = new DisplayColorInfo(isHdr, sdrWhiteNits);
                 }
             }
             catch (Exception ex)
@@ -258,6 +282,73 @@ namespace SystemTrayApp
 
             return result;
         }
+
+        private static double? QuerySdrWhiteNits(LUID adapterId, uint targetId)
+        {
+            var info = new DISPLAYCONFIG_SDR_WHITE_LEVEL();
+            info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            info.header.size = Marshal.SizeOf<DISPLAYCONFIG_SDR_WHITE_LEVEL>();
+            info.header.adapterId = adapterId;
+            info.header.id = targetId;
+            if (DisplayConfigGetDeviceInfo(ref info) != ERROR_SUCCESS || info.SDRWhiteLevel == 0)
+            {
+                return null;
+            }
+            return info.SDRWhiteLevel / 1000.0 * 80;
+        }
+
+        /// <summary>
+        /// Picks the LUT method for the GPU driving a display, from its adapter description
+        /// (e.g. "NVIDIA GeForce RTX 5070 Ti"). AMD needs its own method; everything else uses
+        /// the NVIDIA one, which is also the generator's default.
+        /// </summary>
+        public static LutMethod DetectLutMethod(string adapterName)
+        {
+            try
+            {
+                for (uint i = 0; ; i++)
+                {
+                    var adapter = new DISPLAY_DEVICE();
+                    adapter.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
+                    if (!EnumDisplayDevices(null, i, ref adapter, 0))
+                    {
+                        break;
+                    }
+
+                    if (string.Equals(adapter.DeviceName, @"\\.\" + adapterName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string gpu = adapter.DeviceString ?? "";
+                        return gpu.Contains("AMD", StringComparison.OrdinalIgnoreCase)
+                            || gpu.Contains("Radeon", StringComparison.OrdinalIgnoreCase)
+                            ? LutMethod.Amd
+                            : LutMethod.Nvidia;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error detecting GPU vendor for {adapterName}: {ex}");
+            }
+            return LutMethod.Nvidia;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DISPLAY_DEVICE
+        {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceKey;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
 
         private static bool? QueryIsHdr(LUID adapterId, uint targetId)
         {

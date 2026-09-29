@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.3.0] - 2026-09-29
 
 ### Added
+- Built-in LUT generator (a port of dylanraga's web generator): each monitor's gamma curve is
+  generated from its current Windows "SDR content brightness" and regenerated automatically when
+  the slider moves, so `lut.cal` no longer has to be made and edited by hand. A new "Gamma Curve"
+  menu shows each monitor's SDR brightness and sets gamma (2.2/2.4), black floor and GPU method
+  (NVIDIA/AMD, detected automatically). "Use lut.cal File" keeps the previous behavior, and is
+  selected automatically if `scripts/lut.cal` was hand-edited.
 - "Only Apply When HDR Is On" option (on by default): the HDR-tuned LUT is skipped on displays
   in SDR mode, removed when HDR is switched off, and reapplied automatically when it's turned
   back on.
@@ -23,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback where the ramp can't be read, and is now capped at 60 seconds.
 
 ### Fixed
+- The README described the bundled `lut.cal` as made for 40% SDR brightness; it is the
+  generator's output for 300 nits (slider 55), gamma 2.2, NVIDIA method.
 - The profile is reapplied after resume from sleep, session unlock and console connect, and
   checked again shortly after startup, where Windows' Calibration Loader task or the graphics
   driver can silently reset the gamma ramp.

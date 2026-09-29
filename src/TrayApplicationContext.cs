@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32; // Added for Registry access clarity
 using System.Drawing; // Added for Icon/SystemIcons clarity
 using System.Text.RegularExpressions; // Added for monitor detection parsing
+using System.Globalization;
 
 namespace SystemTrayApp
 {
@@ -79,7 +80,21 @@ namespace SystemTrayApp
             public required string AdapterName { get; init; }
             public bool GammaApplied { get; init; } // False: skipped because HDR was off
             public ushort[]? Ramp { get; init; }    // Ramp read back after applying; null = can't verify
+            public double? SdrWhiteNits { get; init; } // White level the generated LUT was built for; null = lut.cal file used
         }
+
+        // --- Gamma curve (LUT) ---
+        // Automatic: generate each monitor's LUT from its current SDR content brightness, like
+        // dylanraga's web generator. Otherwise scripts\lut.cal is loaded as-is.
+        private bool _autoLut = true;
+        private double _lutGamma = LutGenerator.BundledGamma;
+        private double _lutBlackFloor = LutGenerator.BundledBlackLevel; // nits
+        private LutMethod? _lutMethodOverride; // null = pick from the GPU vendor
+        private static readonly double[] LutGammaOptions = { 2.2, 2.4 };
+        private static readonly double[] LutBlackFloorOptions = { 0, 0.1, 0.2, 0.3, 0.5, 1.0 };
+        private static readonly string GeneratedLutDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HDRGammaFix", "luts");
+        private ToolStripMenuItem? _lutMenuItem;
         private List<AppliedMonitorState> _appliedMonitorStates = new List<AppliedMonitorState>();
 
         // Suppresses dispwin launches once Windows shutdown/logoff begins. Expressed as an expiry
@@ -168,6 +183,7 @@ namespace SystemTrayApp
             LoadNotificationSetting(); // Load user's notification preference
             _hdrOnly = ReadBoolSetting("HdrOnly", true);
             _revertOnExit = ReadBoolSetting("RevertOnExit", false);
+            LoadLutSettings();
             LoadHotkeySettings(); // Load user's hotkey preference
             RepairStartupPathIfMoved();
             InitializeComponent(); // Initialize UI elements
@@ -253,6 +269,12 @@ namespace SystemTrayApp
                 WriteBoolSetting("RevertOnExit", _revertOnExit);
             };
             _contextMenu.Items.Add(revertOnExitItem);
+
+            // Rebuilt on every open so the brightness readout and check marks are current.
+            _lutMenuItem = new ToolStripMenuItem("Gamma Curve");
+            _lutMenuItem.DropDownItems.Add(new ToolStripMenuItem("...")); // Placeholder so the arrow shows
+            _lutMenuItem.DropDownOpening += (s, e) => BuildLutMenuItems(_lutMenuItem);
+            _contextMenu.Items.Add(_lutMenuItem);
 
             // Add hotkey configuration option
             var hotkeyItem = new ToolStripMenuItem("Configure Hotkeys...");
@@ -424,8 +446,9 @@ namespace SystemTrayApp
 
         /// <summary>
         /// Compares the live display state with what the last apply did. Returns a reason if the
-        /// profile needs to be reapplied (HDR switched on/off, or the loaded ramp was replaced),
-        /// otherwise null. Only uses cheap in-process queries, so it's safe to call every tick.
+        /// profile needs to be reapplied (HDR switched on/off, SDR brightness changed while the
+        /// LUT is generated from it, or the loaded ramp was replaced), otherwise null. Only uses
+        /// cheap in-process queries, so it's safe to call every tick.
         /// </summary>
         private string? DetectAppliedStateDrift()
         {
@@ -434,7 +457,9 @@ namespace SystemTrayApp
                 return null;
             }
 
-            Dictionary<string, bool>? hdrByAdapter = _hdrOnly ? DisplayState.GetHdrStateByAdapter() : null;
+            Dictionary<string, DisplayState.DisplayColorInfo>? colorInfo = _hdrOnly || _autoLut
+                ? DisplayState.GetColorInfoByAdapter()
+                : null;
 
             foreach (var state in _appliedMonitorStates)
             {
@@ -443,10 +468,19 @@ namespace SystemTrayApp
                     continue;
                 }
 
-                if (hdrByAdapter != null && hdrByAdapter.TryGetValue(state.AdapterName, out bool isHdr)
-                    && isHdr != state.GammaApplied)
+                DisplayState.DisplayColorInfo info = default;
+                bool hasInfo = colorInfo != null && colorInfo.TryGetValue(state.AdapterName, out info);
+
+                if (_hdrOnly && hasInfo && info.IsHdr is bool isHdr && isHdr != state.GammaApplied)
                 {
                     return isHdr ? "HDR was turned on." : "HDR was turned off.";
+                }
+
+                if (_autoLut && hasInfo && state.GammaApplied
+                    && state.SdrWhiteNits is double builtFor && info.SdrWhiteNits is double currentNits
+                    && Math.Abs(currentNits - builtFor) > 0.5)
+                {
+                    return "SDR content brightness changed.";
                 }
 
                 if (state.GammaApplied && state.Ramp != null)
@@ -1051,6 +1085,236 @@ namespace SystemTrayApp
             {
                 // Ignore save errors
                 Debug.WriteLine($"Error saving setting {name}: {ex}");
+            }
+        }
+
+        // --- Gamma Curve (LUT) ---
+
+        private void LoadLutSettings()
+        {
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath, false);
+
+                // No saved choice: generate automatically, unless scripts\lut.cal was hand-edited -
+                // then keep using it, so upgrading doesn't silently discard someone's tuning.
+                _autoLut = (key?.GetValue("LutMode") as string) switch
+                {
+                    "Auto" => true,
+                    "Custom" => false,
+                    _ => IsCustomLutUnmodified()
+                };
+
+                if (double.TryParse(key?.GetValue("LutGamma") as string, NumberStyles.Float, CultureInfo.InvariantCulture, out double gamma)
+                    && LutGammaOptions.Contains(gamma))
+                {
+                    _lutGamma = gamma;
+                }
+
+                if (double.TryParse(key?.GetValue("LutBlackFloor") as string, NumberStyles.Float, CultureInfo.InvariantCulture, out double blackFloor)
+                    && LutBlackFloorOptions.Contains(blackFloor))
+                {
+                    _lutBlackFloor = blackFloor;
+                }
+
+                _lutMethodOverride = Enum.TryParse(key?.GetValue("LutMethod") as string, out LutMethod method)
+                    ? method
+                    : null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading gamma curve settings: {ex}");
+            }
+        }
+
+        private static void WriteStringSetting(string name, string? value)
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
+                if (value == null)
+                {
+                    key?.DeleteValue(name, false);
+                }
+                else
+                {
+                    key?.SetValue(name, value);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Ignore save errors
+                Debug.WriteLine($"Error saving setting {name}: {ex}");
+            }
+        }
+
+        private string GetCustomLutPath()
+        {
+            string dispwinPath = FindDispwinExecutable();
+            string directory = string.IsNullOrEmpty(dispwinPath)
+                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scripts")
+                : Path.GetDirectoryName(dispwinPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+            return Path.Combine(directory, "lut.cal");
+        }
+
+        /// <summary>True if scripts\lut.cal is missing or still the file shipped with the app.</summary>
+        private bool IsCustomLutUnmodified()
+        {
+            try
+            {
+                string path = GetCustomLutPath();
+                return !File.Exists(path) || LutGenerator.CalDataEquivalent(File.ReadAllText(path),
+                    LutGenerator.GenerateCal(LutGenerator.BundledWhiteLevel, LutGenerator.BundledBlackLevel,
+                                             LutGenerator.BundledGamma, LutGenerator.BundledMethod));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error checking lut.cal: {ex}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Generates the LUT for a display's current SDR white level and writes it under
+        /// %LOCALAPPDATA% (the app folder may be read-only, or protected by Controlled Folder
+        /// Access). Returns the file path, or null if it couldn't be written.
+        /// </summary>
+        private string? WriteGeneratedLut(string adapterName, double whiteNits)
+        {
+            if (string.IsNullOrEmpty(adapterName))
+            {
+                return null;
+            }
+
+            try
+            {
+                LutMethod method = _lutMethodOverride ?? DisplayState.DetectLutMethod(adapterName);
+                string contents = LutGenerator.GenerateCal(whiteNits, _lutBlackFloor, _lutGamma, method);
+
+                Directory.CreateDirectory(GeneratedLutDirectory);
+                string path = Path.Combine(GeneratedLutDirectory, $"lut-{adapterName}.cal");
+
+                // Only rewrite when the curve changed. Write to a temp file and swap it in, so
+                // dispwin can never read a half-written LUT.
+                if (!File.Exists(path) || File.ReadAllText(path) != contents)
+                {
+                    string tempPath = path + ".tmp";
+                    File.WriteAllText(tempPath, contents);
+                    File.Move(tempPath, path, overwrite: true);
+                }
+
+                return path;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error writing generated LUT for {adapterName}: {ex}");
+                return null;
+            }
+        }
+
+        private void BuildLutMenuItems(ToolStripMenuItem menu)
+        {
+            menu.DropDownItems.Clear();
+
+            // Current SDR brightness of each HDR display, i.e. what the automatic curve targets
+            foreach (var entry in DisplayState.GetColorInfoByAdapter())
+            {
+                if (entry.Value.IsHdr != true || entry.Value.SdrWhiteNits is not double nits)
+                {
+                    continue;
+                }
+
+                var monitor = _availableMonitors.FirstOrDefault(m =>
+                    string.Equals(m.AdapterName, entry.Key, StringComparison.OrdinalIgnoreCase));
+                string name = monitor.HardwareId != null ? $"Monitor {monitor.DisplayNumber}" : entry.Key;
+                menu.DropDownItems.Add(new ToolStripMenuItem(
+                    $"{name}: SDR brightness {LutGenerator.NitsToSlider(nits):0.#} ({nits:0} nits)")
+                {
+                    Enabled = false
+                });
+            }
+            if (menu.DropDownItems.Count > 0)
+            {
+                menu.DropDownItems.Add(new ToolStripSeparator());
+            }
+
+            menu.DropDownItems.Add(new ToolStripMenuItem("Match SDR Brightness (Automatic)", null, (s, e) =>
+            {
+                _autoLut = true;
+                WriteStringSetting("LutMode", "Auto");
+                ReapplyAfterLutSettingChange();
+            })
+            { Checked = _autoLut });
+
+            menu.DropDownItems.Add(new ToolStripMenuItem("Use lut.cal File", null, (s, e) =>
+            {
+                _autoLut = false;
+                WriteStringSetting("LutMode", "Custom");
+                ReapplyAfterLutSettingChange();
+            })
+            {
+                Checked = !_autoLut,
+                ToolTipText = GetCustomLutPath()
+            });
+
+            menu.DropDownItems.Add(new ToolStripSeparator());
+
+            foreach (double gamma in LutGammaOptions)
+            {
+                double capturedGamma = gamma;
+                menu.DropDownItems.Add(new ToolStripMenuItem(
+                    $"Gamma {gamma.ToString("0.0", CultureInfo.InvariantCulture)}", null, (s, e) =>
+                    {
+                        _lutGamma = capturedGamma;
+                        WriteStringSetting("LutGamma", capturedGamma.ToString(CultureInfo.InvariantCulture));
+                        ReapplyAfterLutSettingChange();
+                    })
+                {
+                    Checked = _lutGamma == gamma,
+                    Enabled = _autoLut
+                });
+            }
+
+            var blackFloorMenu = new ToolStripMenuItem("Black Floor") { Enabled = _autoLut };
+            foreach (double blackFloor in LutBlackFloorOptions)
+            {
+                double capturedFloor = blackFloor;
+                string label = blackFloor == 0
+                    ? "0 nits (default)"
+                    : $"{blackFloor.ToString("0.0", CultureInfo.InvariantCulture)} nits";
+                blackFloorMenu.DropDownItems.Add(new ToolStripMenuItem(label, null, (s, e) =>
+                {
+                    _lutBlackFloor = capturedFloor;
+                    WriteStringSetting("LutBlackFloor", capturedFloor.ToString(CultureInfo.InvariantCulture));
+                    ReapplyAfterLutSettingChange();
+                })
+                { Checked = _lutBlackFloor == blackFloor });
+            }
+            blackFloorMenu.ToolTipText = "Increase if dark detail is crushed to black";
+            menu.DropDownItems.Add(blackFloorMenu);
+
+            var methodMenu = new ToolStripMenuItem("GPU Method") { Enabled = _autoLut };
+            methodMenu.DropDownItems.Add(new ToolStripMenuItem("Detect Automatically", null, (s, e) => SetLutMethod(null))
+            { Checked = _lutMethodOverride == null });
+            methodMenu.DropDownItems.Add(new ToolStripMenuItem("NVIDIA", null, (s, e) => SetLutMethod(LutMethod.Nvidia))
+            { Checked = _lutMethodOverride == LutMethod.Nvidia });
+            methodMenu.DropDownItems.Add(new ToolStripMenuItem("AMD", null, (s, e) => SetLutMethod(LutMethod.Amd))
+            { Checked = _lutMethodOverride == LutMethod.Amd });
+            menu.DropDownItems.Add(methodMenu);
+        }
+
+        private void SetLutMethod(LutMethod? method)
+        {
+            _lutMethodOverride = method;
+            WriteStringSetting("LutMethod", method?.ToString());
+            ReapplyAfterLutSettingChange();
+        }
+
+        private async void ReapplyAfterLutSettingChange()
+        {
+            if (!_isDefaultProfile)
+            {
+                await ApplySrgbToGammaAsync(); // Rebuild and load the curve with the new settings
             }
         }
 
@@ -1720,11 +1984,9 @@ namespace SystemTrayApp
                 return SummarizeResult(reverted, targets.Count);
             }
 
-            // HDR state per display; displays missing from the map (unknown) are treated as HDR,
-            // so a failed query falls back to applying the LUT as before.
-            Dictionary<string, bool> hdrByAdapter = _hdrOnly
-                ? DisplayState.GetHdrStateByAdapter()
-                : new Dictionary<string, bool>();
+            // HDR state and SDR white level per display. A display whose HDR state is unknown is
+            // treated as HDR, so a failed query falls back to applying the LUT as before.
+            var colorInfo = DisplayState.GetColorInfoByAdapter();
 
             var previousStates = _appliedMonitorStates;
             var newStates = new List<AppliedMonitorState>();
@@ -1737,8 +1999,8 @@ namespace SystemTrayApp
                     break;
                 }
 
-                bool isHdr = !hdrByAdapter.TryGetValue(monitor.AdapterName, out bool hdr) || hdr;
-                if (!isHdr)
+                colorInfo.TryGetValue(monitor.AdapterName, out var info);
+                if (_hdrOnly && info.IsHdr == false)
                 {
                     // HDR is off: the HDR-tuned LUT would make this display look wrong. Only undo it
                     // if we loaded it here earlier (e.g. HDR was just switched off) and it's still
@@ -1758,8 +2020,22 @@ namespace SystemTrayApp
                     continue;
                 }
 
+                // Automatic mode: build this display's LUT for its current SDR brightness. The
+                // white level only means something in HDR mode; otherwise, or if it can't be read
+                // or the file can't be written, fall back to scripts\lut.cal.
+                string? generatedLutPath = null;
+                double? builtForNits = null;
+                if (_autoLut && info.IsHdr == true && info.SdrWhiteNits is double whiteNits)
+                {
+                    generatedLutPath = WriteGeneratedLut(monitor.AdapterName, whiteNits);
+                    if (generatedLutPath != null)
+                    {
+                        builtForNits = whiteNits;
+                    }
+                }
+
                 attempted++;
-                bool ok = await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber);
+                bool ok = await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber, generatedLutPath);
                 if (ok)
                 {
                     succeeded++;
@@ -1779,7 +2055,8 @@ namespace SystemTrayApp
                     HardwareId = monitor.HardwareId,
                     AdapterName = monitor.AdapterName,
                     GammaApplied = true,
-                    Ramp = ramp
+                    Ramp = ramp,
+                    SdrWhiteNits = builtForNits
                 });
             }
 
@@ -1816,7 +2093,8 @@ namespace SystemTrayApp
             return current == null || DisplayState.RampsEqual(current, state.Ramp);
         }
         
-        private async Task<bool> ExecuteBatchFileForMonitorAsync(string fileName, int monitorIndex)
+        /// <param name="lutPathOverride">For an apply: the .cal file to load instead of scripts\lut.cal.</param>
+        private async Task<bool> ExecuteBatchFileForMonitorAsync(string fileName, int monitorIndex, string? lutPathOverride = null)
         {
             if (IsShuttingDown)
             {
@@ -1842,7 +2120,7 @@ namespace SystemTrayApp
                 if (fileName.Contains("srgb-to-gamma"))
                 {
                     // Apply gamma profile to specific monitor
-                    string lutPath = Path.Combine(workingDirectory, "lut.cal");
+                    string lutPath = lutPathOverride ?? Path.Combine(workingDirectory, "lut.cal");
                     arguments = $"-d {monitorIndex} \"{lutPath}\"";
                 }
                 else if (fileName.Contains("revert"))

@@ -12,10 +12,12 @@ This tool is designed to stay in your system tray, allowing you to quickly switc
   <img src="ui.png" alt="HDR Gamma Fix Interface" />
 </div>
 
-**Based on:** [win11hdr-srgb-to-gamma2.2-icm](https://github.com/dylanraga/win11hdr-srgb-to-gamma2.2-icm) by dylanraga. This project provides a convenient interface for applying the color calibration approach described in that repository. The brightness values can be adjusted to suit your monitor's needs by modifying the 'lut.cal' file in the scripts folder. Refer to the guide in dylanraga's repository for detailed instructions.
+**Based on:** [win11hdr-srgb-to-gamma2.2-icm](https://github.com/dylanraga/win11hdr-srgb-to-gamma2.2-icm) by dylanraga. This project provides a convenient interface for applying the color calibration approach described in that repository.
 
-### Current Configuration
-Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brightness. You may need to experiment with these settings to achieve optimal results for your display. Refer to the guide in dylanraga's repository for detailed instructions.
+### Gamma Curve
+The correction curve (LUT) depends on the **SDR content brightness** slider in Windows HDR settings. By default the app generates the curve itself, per monitor, from that slider's current value, using the same formula as dylanraga's [LUT generator](https://dylanraga.github.io/gen-srgb-to-gamma-lut/). Moving the slider regenerates and reapplies it automatically, so there is no file to edit.
+
+Under **Gamma Curve** in the tray menu you can change the gamma (2.2 or 2.4), raise the black floor if dark detail is crushed, and override the GPU method (NVIDIA or AMD, detected automatically). If you prefer a hand-made curve, choose **Use lut.cal File** and replace `scripts/lut.cal` with the generator's output. The bundled `lut.cal` is the generator's output for 300 nits (slider 55), gamma 2.2, NVIDIA method, and a hand-edited `lut.cal` is kept in use automatically after upgrading.
 
 ## Features
 
@@ -51,6 +53,7 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
   - Individual monitor selection (Monitor 1, Monitor 2, etc.)
 - Show Notifications (toggleable)
 - Only Apply When HDR Is On (toggleable, on by default)
+- Gamma Curve (current SDR brightness per monitor; automatic curve or lut.cal file; gamma, black floor, GPU method)
 - Revert on Exit (toggleable, off by default)
 
 ## Requirements
@@ -113,7 +116,8 @@ When moving or sharing the application, ensure these files stay together:
 
 ### Settings Location
 All preferences (monitor selection, notifications, hotkeys, run at startup) are stored under
-`HKEY_CURRENT_USER\SOFTWARE\HDRGammaFix` and can be reset by deleting that key.
+`HKEY_CURRENT_USER\SOFTWARE\HDRGammaFix` and can be reset by deleting that key. Automatically
+generated curves are written to `%LOCALAPPDATA%\HDRGammaFix\luts`.
 
 ## License
 
