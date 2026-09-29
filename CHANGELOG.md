@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   menu shows each monitor's SDR brightness and sets gamma (2.2/2.4), black floor and GPU method
   (NVIDIA/AMD, detected automatically). "Use lut.cal File" keeps the previous behavior, and is
   selected automatically if `scripts/lut.cal` was hand-edited.
+- "Pause for Apps...": list apps such as HDR games (whose shadows the curve would darken), and
+  the fix pauses while one of them is in the foreground and resumes when it loses focus. The
+  apply hotkey keeps the fix on in a listed app until you switch away.
 - "Only Apply When HDR Is On" option (on by default): the HDR-tuned LUT is skipped on displays
   in SDR mode, removed when HDR is switched off, and reapplied automatically when it's turned
   back on.

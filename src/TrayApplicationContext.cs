@@ -29,6 +29,12 @@ namespace SystemTrayApp
         private bool _isPaused;
         private string? _pausedReason;
 
+        // --- Pause for apps (e.g. HDR games, which the SDR-only curve would darken) ---
+        private List<string> _pauseApps = new List<string>(); // Exe file names, e.g. "Cyberpunk2077.exe"
+        private ForegroundAppWatcher? _foregroundWatcher;
+        private string? _pausedForApp;     // Listed app in front, LUT removed for it; null = not paused for an app
+        private string? _appPauseOverride; // User turned the fix on while this app was in front: leave it on until the app loses focus
+
         // P/Invoke declarations for global hotkeys
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -193,6 +199,7 @@ namespace SystemTrayApp
             _hdrOnly = ReadBoolSetting("HdrOnly", true);
             _revertOnExit = ReadBoolSetting("RevertOnExit", false);
             LoadLutSettings();
+            _pauseApps = ReadPauseApps();
             LoadHotkeySettings(); // Load user's hotkey preference
             RepairStartupPathIfMoved();
             InitializeComponent(); // Initialize UI elements
@@ -203,6 +210,10 @@ namespace SystemTrayApp
             // Windows' Calibration Loader may overwrite it moments later, so check again shortly.
             _ = ApplySrgbToGammaAsync();
             ScheduleFollowUpRecovery("Windows reloaded its default calibration after sign-in.");
+
+            _foregroundWatcher = new ForegroundAppWatcher();
+            _foregroundWatcher.ForegroundAppChanged += EvaluateAppPause;
+            EvaluateAppPause(_foregroundWatcher.Current); // A listed game may already be in front
         }
 
         private void InitializeComponent()
@@ -284,6 +295,10 @@ namespace SystemTrayApp
             _lutMenuItem.DropDownItems.Add(new ToolStripMenuItem("...")); // Placeholder so the arrow shows
             _lutMenuItem.DropDownOpening += (s, e) => BuildLutMenuItems(_lutMenuItem);
             _contextMenu.Items.Add(_lutMenuItem);
+
+            var pauseAppsItem = new ToolStripMenuItem("Pause for Apps...");
+            pauseAppsItem.Click += OnConfigurePauseApps;
+            _contextMenu.Items.Add(pauseAppsItem);
 
             // Add hotkey configuration option
             var hotkeyItem = new ToolStripMenuItem("Configure Hotkeys...");
@@ -393,7 +408,7 @@ namespace SystemTrayApp
         {
             // Don't pile up requests while a reapply is pending or running: rescheduling would keep
             // restarting the recovery delay every tick, so it would never fire.
-            if (_isDefaultProfile || _isOperationInProgress || _profileRecoveryTimer.Enabled
+            if (_isDefaultProfile || _pausedForApp != null || _isOperationInProgress || _profileRecoveryTimer.Enabled
                 || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
                 return;
@@ -666,14 +681,15 @@ namespace SystemTrayApp
 
         private void ScheduleProfileRecovery(string reason, bool showNotification = true)
         {
-            if (IsShuttingDown || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
+            // Paused for a foreground app: the LUT is off on purpose, so nothing to recover
+            if (IsShuttingDown || _isDefaultProfile || _pausedForApp != null || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
                 return;
             }
 
             RunOnUiThread(() =>
             {
-                if (_isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
+                if (_isDefaultProfile || _pausedForApp != null || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
                 {
                     return;
                 }
@@ -1331,6 +1347,149 @@ namespace SystemTrayApp
             }
         }
 
+        // --- Pause for Apps ---
+
+        private static List<string> ReadPauseApps()
+        {
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath, false);
+                return (key?.GetValue("PauseForApps") as string[] ?? Array.Empty<string>())
+                    .Where(a => !string.IsNullOrWhiteSpace(a))
+                    .Select(a => a.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading pause apps: {ex}");
+                return new List<string>();
+            }
+        }
+
+        private static void WritePauseApps(List<string> apps)
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
+                key?.SetValue("PauseForApps", apps.ToArray(), RegistryValueKind.MultiString);
+            }
+            catch (Exception ex)
+            {
+                // Ignore save errors
+                Debug.WriteLine($"Error saving pause apps: {ex}");
+            }
+        }
+
+        private void OnConfigurePauseApps(object? sender, EventArgs e)
+        {
+            using var dialog = new PauseAppsDialog(_pauseApps);
+            if (dialog.ShowDialog() != DialogResult.OK)
+            {
+                return;
+            }
+
+            _pauseApps = dialog.Apps;
+            WritePauseApps(_pauseApps);
+            EvaluateAppPause(_foregroundWatcher?.Current); // The app in front may have just been added or removed
+        }
+
+        /// <summary>
+        /// Pauses the fix while a listed app is in the foreground and resumes it when that app
+        /// loses focus. Called whenever the foreground app changes.
+        /// </summary>
+        private async void EvaluateAppPause(string? foregroundExe)
+        {
+            try
+            {
+                // Don't interleave with an apply/revert; decide once it's done, on the latest state.
+                while (_isOperationInProgress)
+                {
+                    await Task.Delay(200);
+                }
+                if (IsShuttingDown)
+                {
+                    return;
+                }
+                foregroundExe = _foregroundWatcher?.Current ?? foregroundExe;
+
+                if (_appPauseOverride != null
+                    && !string.Equals(foregroundExe, _appPauseOverride, StringComparison.OrdinalIgnoreCase))
+                {
+                    _appPauseOverride = null; // The overridden app lost focus; pause for it again next time
+                }
+
+                string? listedApp = foregroundExe == null ? null
+                    : _pauseApps.FirstOrDefault(a => string.Equals(a, foregroundExe, StringComparison.OrdinalIgnoreCase));
+                bool shouldPause = listedApp != null && _appPauseOverride == null;
+
+                if (shouldPause && _pausedForApp == null)
+                {
+                    await PauseForAppAsync(foregroundExe!);
+                }
+                else if (!shouldPause && _pausedForApp != null)
+                {
+                    await ResumeFromAppPauseAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                // An escaped exception in an async void method would crash the app.
+                Debug.WriteLine($"Error evaluating app pause: {ex}");
+            }
+        }
+
+        private async Task PauseForAppAsync(string exeName)
+        {
+            if (_isDefaultProfile || IsShuttingDown || _isOperationInProgress)
+            {
+                return; // Fix is off: nothing to pause
+            }
+
+            _isOperationInProgress = true;
+            try
+            {
+                SuppressProfileRecoveryEvents();
+                _profileRecoveryTimer.Stop();
+                _followUpRecoveryTimer.Stop();
+                _settingsWatchdogTimer.Stop();
+                _pendingProfileRecoveryReason = null;
+                _pendingProfileRecoveryNotification = false;
+
+                // Remove the LUT, unless nothing is loaded anyway (already paused because HDR is off
+                // or the monitor is disconnected) - then there's nothing to undo.
+                if (!_isPaused)
+                {
+                    var result = await ExecuteBatchFileAsync("revert.bat");
+                    if (result == ApplyResult.Failed)
+                    {
+                        _settingsWatchdogTimer.Start(); // The LUT may still be loaded; keep watching it
+                        return;
+                    }
+                }
+
+                // No notification: a toast popping up over a game that just got focus would be annoying.
+                _pausedForApp = exeName;
+                _appliedMonitorStates = new List<AppliedMonitorState>();
+                UpdateIconAndText();
+            }
+            finally
+            {
+                SuppressProfileRecoveryEvents();
+                _isOperationInProgress = false;
+            }
+        }
+
+        private async Task ResumeFromAppPauseAsync()
+        {
+            _pausedForApp = null;
+            UpdateIconAndText();
+            if (!_isDefaultProfile)
+            {
+                await ApplySrgbToGammaAsync(showNotification: false);
+            }
+        }
+
         // --- Hotkey Configuration ---
         private void LoadHotkeySettings()
         {
@@ -1701,7 +1860,7 @@ namespace SystemTrayApp
             switch (hotkeyId)
             {
                 case HOTKEY_ID_GAMMA:
-                    await ApplySrgbToGammaAsync();
+                    await ApplySrgbToGammaAsync(userInitiated: true);
                     break;
 
                 case HOTKEY_ID_DEFAULT:
@@ -1800,7 +1959,7 @@ namespace SystemTrayApp
         {
             if (_isDefaultProfile)
             {
-                await ApplySrgbToGammaAsync();
+                await ApplySrgbToGammaAsync(userInitiated: true);
             }
             else
             {
@@ -1812,10 +1971,13 @@ namespace SystemTrayApp
         {
             if (_notifyIcon == null) return;
 
-            _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon : _isPaused ? _pausedIcon : _gammaIcon;
+            _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon
+                : _isPaused || _pausedForApp != null ? _pausedIcon
+                : _gammaIcon;
 
             // Build tooltip text with monitor information
             string profileText = _isDefaultProfile ? "Default"
+                : _pausedForApp != null ? $"Paused while {_pausedForApp} is in front"
                 : _isPaused ? $"Paused{_pausedReason}"
                 : "sRGB to Gamma";
             string monitorText = GetMonitorDisplayText();
@@ -1842,11 +2004,26 @@ namespace SystemTrayApp
             return $" ({_selectedMonitorLastKnownName ?? "Selected Monitor"} - not connected)";
         }
 
-        private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
+        /// <param name="userInitiated">True for the hotkey, menu item and tray click. Only those
+        /// override a pause for a foreground app; automatic reapplies wait until it loses focus.</param>
+        private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false,
+            string? recoveryReason = null, bool userInitiated = false)
         {
             if (IsShuttingDown || _isOperationInProgress)
             {
                 return;
+            }
+
+            if (_pausedForApp != null)
+            {
+                if (!userInitiated)
+                {
+                    return;
+                }
+
+                // The user wants the fix in this app after all: keep it on until the app loses focus.
+                _appPauseOverride = _pausedForApp;
+                _pausedForApp = null;
             }
 
             _isOperationInProgress = true;
@@ -1942,6 +2119,7 @@ namespace SystemTrayApp
                     _appliedMonitorStates = new List<AppliedMonitorState>();
                     _isDefaultProfile = true;
                     _isPaused = false;
+                    _pausedForApp = null;
                     UpdateIconAndText();
 
                     if (showNotification)
@@ -1976,7 +2154,7 @@ namespace SystemTrayApp
             }
         }
 
-        private async void OnApplySrgbToGamma(object? sender, EventArgs e) => await ApplySrgbToGammaAsync();
+        private async void OnApplySrgbToGamma(object? sender, EventArgs e) => await ApplySrgbToGammaAsync(userInitiated: true);
         private async void OnRevertToDefault(object? sender, EventArgs e) => await RevertToDefaultAsync();
 
 
@@ -2264,6 +2442,8 @@ namespace SystemTrayApp
             // Block further dispwin.exe launches first: an "All Monitors" apply that is mid-loop
             // would otherwise start the next monitor's run after we've waited for the current one.
             _isExiting = true;
+            _foregroundWatcher?.Dispose();
+            _foregroundWatcher = null;
 
             _profileRecoveryTimer?.Stop();
             _settingsWatchdogTimer?.Stop();
@@ -2378,6 +2558,7 @@ namespace SystemTrayApp
                 _profileRecoveryTimer?.Dispose();
                 _settingsWatchdogTimer?.Dispose();
                 _followUpRecoveryTimer?.Dispose();
+                _foregroundWatcher?.Dispose();
                 _defaultIcon?.Dispose();
                 _gammaIcon?.Dispose();
                 _pausedIcon?.Dispose();

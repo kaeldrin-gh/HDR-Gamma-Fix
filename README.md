@@ -18,6 +18,7 @@ HDR Gamma Fix loads a correction curve (a 1D LUT) into the GPU that maps SDR con
 - **Curve matched to your brightness:** the curve is generated per monitor from Windows' SDR content brightness slider and follows it automatically when you move it
 - **Stays applied:** reapplies automatically when Windows resets the curve, e.g. after opening Display Settings, signing in, unlocking, or waking from sleep
 - **HDR-aware:** only affects displays with HDR on, and pauses by itself when you turn HDR off
+- **Pauses for HDR games:** list your HDR games and the fix steps aside while one is in front, then comes back when you switch away
 - **Multi-monitor:** apply to all monitors or pick one; the choice follows the physical monitor even when Windows renumbers displays
 - **Lightweight:** checks run in-process, with no background polling of external tools
 
@@ -43,7 +44,7 @@ The zip contains `HDRGammaFix.exe` and the `scripts` folder (`dispwin.exe` and `
 |------|---------|
 | Monitor outline | Off: Windows' default curve |
 | Blue monitor | On: the gamma curve is applied |
-| Blue outline with pause bars | On but paused: HDR is off, or the selected monitor isn't connected. It resumes by itself. |
+| Blue outline with pause bars | On but paused: HDR is off, the selected monitor isn't connected, or an app from **Pause for Apps** is in front. It resumes by itself. |
 
 Hover over the icon for details, including which monitor is targeted. Left-click toggles the fix on and off.
 
@@ -58,6 +59,7 @@ Hover over the icon for details, including which monitor is targeted. Left-click
 | Only Apply When HDR Is On | Skip displays in SDR mode (on by default) |
 | Revert on Exit | Restore the default curve when you exit (off by default) |
 | Gamma Curve | Current SDR brightness per monitor, and the curve settings below |
+| Pause for Apps... | Apps (such as HDR games) that pause the fix while they're in front |
 | Configure Hotkeys... | Change the two global hotkeys |
 
 ### Gamma curve
@@ -72,6 +74,10 @@ Under **Gamma Curve** you can:
 - choose **Use lut.cal File** to load `scripts/lut.cal` instead, e.g. a curve you made with the web generator
 
 The bundled `lut.cal` is the generator's output for 300 nits (slider 55), gamma 2.2 and the NVIDIA method. If you've edited `lut.cal`, the app keeps using it after upgrading.
+
+### HDR games and videos
+
+Native HDR games and videos don't have the washed-out problem, but the correction curve applies to everything on screen: it leaves highlights above SDR white alone but darkens HDR shadows and mid-tones. Add your HDR games under **Pause for Apps...**, either picking them while they're running or browsing to their `.exe`. The fix then pauses (removing the curve) while one of them is in front, and comes back when you Alt+Tab out or quit. To keep the fix on in a listed game anyway, press the apply hotkey while you're in it; it stays on until you switch away. Switching the curve takes a moment, so a brief flicker when a listed game gains or loses focus is normal.
 
 ## Troubleshooting
 
