@@ -92,6 +92,7 @@ Native HDR games and videos don't have the washed-out problem, but the correctio
   4. Disable MPO system-wide with NVIDIA's workaround: create the DWORD `OverlayTestMode` = `5` under `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Dwm` and reboot. Delete the value and reboot to undo. It may not take effect on the newest Windows 11 builds.
 - **Monitor missing from the menu:** open the menu again after connecting it (the list refreshes), and check that `scripts/dispwin.exe` is present.
 - **Hotkey doesn't work:** another app may already use it; pick another under **Configure Hotkeys...**
+- **No notifications even though Show Notifications is on:** Windows can switch off notifications for an app's exe path, and replacing the exe in the same folder keeps that setting. First check **Settings → System → Notifications** for HDRGammaFix and switch it on. If it isn't listed, move the app to a new folder (e.g. `HDRGammaFix-v2`); Windows then treats it as a new app with notifications on. If **Run at Startup** was on, the app updates it to the new folder the first time you start it from there.
 
 ## Settings and uninstalling
 
