@@ -19,6 +19,15 @@ namespace SystemTrayApp
         private bool _isDefaultProfile = true;  // Track current state
         private Icon _defaultIcon = null!;
         private Icon _gammaIcon = null!;
+        private Icon _pausedIcon = null!;
+        private int _iconSize;               // Tray icon size the icons were drawn for
+        private bool _iconsForLightTaskbar;  // Taskbar theme the "off" icon was drawn for
+
+        // The fix is on, but nothing is loaded right now (HDR off, or the selected monitor is
+        // disconnected). It resumes by itself, so the state stays "on" - but the icon mustn't
+        // claim the curve is applied.
+        private bool _isPaused;
+        private string? _pausedReason;
 
         // P/Invoke declarations for global hotkeys
         [DllImport("user32.dll")]
@@ -634,6 +643,10 @@ namespace SystemTrayApp
 
         private void OnUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
         {
+            // Switching between light and dark mode arrives here; redraw the icons if the taskbar
+            // theme (or tray icon size) changed. A no-op otherwise.
+            RunOnUiThread(LoadIcons);
+
             if (!ShouldRecoverProfileForPreferenceCategory(e.Category))
             {
                 return;
@@ -1730,29 +1743,56 @@ namespace SystemTrayApp
             ScheduleProfileRecovery("Windows refreshed system display settings.");
         }
 
+        /// <summary>
+        /// (Re)creates the three tray icons for the current tray size and taskbar theme, and shows
+        /// the right one. Cheap, and skipped when neither has changed since the last call.
+        /// </summary>
         private void LoadIcons()
         {
-            string defaultIconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "DefaultIcon.ico");
-            string gammaIconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "GammaIcon.ico");
+            int size = SystemInformation.SmallIconSize.Width;
+            bool lightTaskbar = TrayIconRenderer.IsTaskbarLight();
+            if (_defaultIcon != null && size == _iconSize && lightTaskbar == _iconsForLightTaskbar)
+            {
+                return;
+            }
 
+            var previous = new[] { _defaultIcon, _gammaIcon, _pausedIcon };
             try
             {
-                _defaultIcon = File.Exists(defaultIconPath) ? new Icon(defaultIconPath) : SystemIcons.Application;
+                _defaultIcon = TrayIconRenderer.Create(TrayIconState.Off, size, lightTaskbar);
+                _gammaIcon = TrayIconRenderer.Create(TrayIconState.Applied, size, lightTaskbar);
+                _pausedIcon = TrayIconRenderer.Create(TrayIconState.Paused, size, lightTaskbar);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error loading default icon: {ex.Message}");
-                _defaultIcon = SystemIcons.Application;
+                // Fall back to the shipped icon files (without a distinct paused look)
+                Debug.WriteLine($"Error drawing tray icons: {ex.Message}");
+                _defaultIcon = LoadIconFile("DefaultIcon.ico", SystemIcons.Application);
+                _gammaIcon = LoadIconFile("GammaIcon.ico", SystemIcons.Information);
+                _pausedIcon = (Icon)_gammaIcon.Clone();
             }
+            _iconSize = size;
+            _iconsForLightTaskbar = lightTaskbar;
 
+            // Swap the shown icon before releasing the old ones
+            UpdateIconAndText();
+            foreach (var icon in previous)
+            {
+                icon?.Dispose();
+            }
+        }
+
+        private static Icon LoadIconFile(string fileName, Icon fallback)
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", fileName);
             try
             {
-                 _gammaIcon = File.Exists(gammaIconPath) ? new Icon(gammaIconPath) : SystemIcons.Information;
+                return File.Exists(path) ? new Icon(path) : (Icon)fallback.Clone();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error loading gamma icon: {ex.Message}");
-                _gammaIcon = SystemIcons.Information;
+                Debug.WriteLine($"Error loading {fileName}: {ex.Message}");
+                return (Icon)fallback.Clone();
             }
         }
 
@@ -1772,13 +1812,17 @@ namespace SystemTrayApp
         {
             if (_notifyIcon == null) return;
 
-            _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon : _gammaIcon;
-            
+            _notifyIcon.Icon = _isDefaultProfile ? _defaultIcon : _isPaused ? _pausedIcon : _gammaIcon;
+
             // Build tooltip text with monitor information
-            string profileText = _isDefaultProfile ? "Default" : "sRGB to Gamma";
+            string profileText = _isDefaultProfile ? "Default"
+                : _isPaused ? $"Paused{_pausedReason}"
+                : "sRGB to Gamma";
             string monitorText = GetMonitorDisplayText();
-            
-            _notifyIcon.Text = $"HDR Gamma Fix: {profileText}{monitorText}";
+
+            // NotifyIcon.Text throws above 127 characters
+            string text = $"HDR Gamma Fix: {profileText}{monitorText}";
+            _notifyIcon.Text = text.Length <= 127 ? text : text.Substring(0, 124) + "...";
         }
         
         private string GetMonitorDisplayText()
@@ -1815,6 +1859,8 @@ namespace SystemTrayApp
                 {
                     _settingsWatchdogTimer.Start();
                     _isDefaultProfile = false;
+                    _isPaused = result == ApplyResult.HdrOff || result == ApplyResult.MonitorNotConnected;
+                    _pausedReason = result == ApplyResult.HdrOff ? " while HDR is off" : null;
                     UpdateIconAndText();
 
                     if (result == ApplyResult.MonitorNotConnected)
@@ -1895,6 +1941,7 @@ namespace SystemTrayApp
                     _followUpRecoveryTimer.Stop();
                     _appliedMonitorStates = new List<AppliedMonitorState>();
                     _isDefaultProfile = true;
+                    _isPaused = false;
                     UpdateIconAndText();
 
                     if (showNotification)
@@ -2333,6 +2380,7 @@ namespace SystemTrayApp
                 _followUpRecoveryTimer?.Dispose();
                 _defaultIcon?.Dispose();
                 _gammaIcon?.Dispose();
+                _pausedIcon?.Dispose();
                 _notifyIcon?.Dispose();
                 _contextMenu?.Dispose();
                  UnregisterSystemEventHandlers();
