@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-29
+
+### Added
+- "Only Apply When HDR Is On" option (on by default): the HDR-tuned LUT is skipped on displays
+  in SDR mode, removed when HDR is switched off, and reapplied automatically when it's turned
+  back on.
+- "Revert on Exit" option (off by default) that clears the LUT when the app is closed.
+
+### Changed
+- The watchdog now reads the loaded gamma ramp back and reapplies only when Windows actually
+  replaced it, whatever the cause. Previously it guessed from whether Windows Settings was
+  running and reapplied every 4 seconds for as long as `SystemSettings.exe` existed, which on
+  Windows 11 can be long after the Settings window is closed. The guess is kept only as a
+  fallback where the ramp can't be read, and is now capped at 60 seconds.
+
+### Fixed
+- The profile is reapplied after resume from sleep, session unlock and console connect, and
+  checked again shortly after startup, where Windows' Calibration Loader task or the graphics
+  driver can silently reset the gamma ramp.
+- Events caused by the app's own apply/revert could trigger another reapply when the operation
+  took longer than 2 seconds.
+- "Run at Startup" is repointed at the current exe if the registered one no longer exists
+  (e.g. after moving the app folder).
+- Exiting during an "All Monitors" apply can no longer start `dispwin.exe` for the next monitor.
+
 ## [1.2.2] - 2026-09-11
 
 ### Changed

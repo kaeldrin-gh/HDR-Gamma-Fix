@@ -38,6 +38,8 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
 - **Startup Management:** Configure the application to run automatically at Windows startup
 - **Settings Persistence:** All preferences (monitor selection, notification settings) are saved and restored
 - **Visual Status:** Tray icon tooltip shows current profile and selected monitor(s)
+- **Automatic Recovery:** Detects when Windows resets the gamma ramp (Display Settings, sign-in, unlock, resume from sleep) and reapplies the profile
+- **HDR Awareness:** Only applies the profile to displays with HDR on, and restores displays when HDR is switched off (can be disabled)
 
 ### Menu Options
 - Apply sRGB to Gamma (configurable hotkey, default Alt+F1)
@@ -48,6 +50,8 @@ Current configuration for the Xiaomi Pro G27i MiniLed Monitor with 40% SDR Brigh
   - All Monitors (applies to every detected monitor)
   - Individual monitor selection (Monitor 1, Monitor 2, etc.)
 - Show Notifications (toggleable)
+- Only Apply When HDR Is On (toggleable, on by default)
+- Revert on Exit (toggleable, off by default)
 
 ## Requirements
 
@@ -104,7 +108,7 @@ When moving or sharing the application, ensure these files stay together:
 
 ### Profile Not Applied
 - Verify all required files are present in the application folder
-- Ensure HDR is enabled in Windows Display Settings for the target monitor
+- Ensure HDR is enabled in Windows Display Settings for the target monitor (with "Only Apply When HDR Is On" checked, displays in SDR mode are skipped)
 - Try applying to individual monitors if "All Monitors" isn't working
 
 ### Settings Location

@@ -51,15 +51,36 @@ namespace SystemTrayApp
         // --- Profile Recovery ---
         private System.Windows.Forms.Timer _profileRecoveryTimer = null!;
         private System.Windows.Forms.Timer _settingsWatchdogTimer = null!;
+        private System.Windows.Forms.Timer _followUpRecoveryTimer = null!;
         private const int ProfileRecoveryDelayMilliseconds = 1500;
         private const int SettingsWatchdogIntervalMilliseconds = 1000;
+        // Windows' "Calibration Loader" task reloads the default gamma ramp at sign-in and on
+        // console connect, and the driver may reset it after resume - often a few seconds after
+        // the event we react to. A second check this long after such events catches that.
+        private const int FollowUpRecoveryDelayMilliseconds = 15000;
         private static readonly TimeSpan ProfileRecoverySuppressionWindow = TimeSpan.FromSeconds(2);
         private static readonly TimeSpan SettingsWatchdogReapplyInterval = TimeSpan.FromSeconds(4);
+        // SystemSettings.exe often stays alive (suspended) long after its window is closed, so the
+        // repeated reapply while it's running is capped instead of lasting as long as the process.
+        private static readonly TimeSpan SettingsWatchdogMaxReapplyDuration = TimeSpan.FromSeconds(60);
         private DateTime _ignoreProfileRecoveryEventsUntilUtc = DateTime.MinValue;
         private DateTime _lastSettingsWatchdogRecoveryUtc = DateTime.MinValue;
+        private DateTime _systemSettingsFirstSeenUtc = DateTime.MinValue;
         private string? _pendingProfileRecoveryReason;
         private bool _pendingProfileRecoveryNotification;
+        private string? _pendingFollowUpRecoveryReason;
         private bool _wasSystemSettingsRunning;
+
+        // What the last apply did on each targeted monitor, so the watchdog can tell whether the
+        // LUT is still loaded (by reading the ramp back) and whether HDR was switched on or off.
+        private sealed class AppliedMonitorState
+        {
+            public required string HardwareId { get; init; }
+            public required string AdapterName { get; init; }
+            public bool GammaApplied { get; init; } // False: skipped because HDR was off
+            public ushort[]? Ramp { get; init; }    // Ramp read back after applying; null = can't verify
+        }
+        private List<AppliedMonitorState> _appliedMonitorStates = new List<AppliedMonitorState>();
 
         // Suppresses dispwin launches once Windows shutdown/logoff begins. Expressed as an expiry
         // time rather than a permanent flag, because a shutdown can be cancelled by another app
@@ -67,6 +88,8 @@ namespace SystemTrayApp
         private DateTime _sessionEndingSuppressUntilUtc = DateTime.MinValue;
         private static readonly TimeSpan SessionEndingSuppressWindow = TimeSpan.FromSeconds(30);
         private bool IsSessionEnding => DateTime.UtcNow < _sessionEndingSuppressUntilUtc;
+        private bool _isExiting; // Set once Exit is chosen, so no further dispwin.exe runs start
+        private bool IsShuttingDown => _isExiting || IsSessionEnding;
         private bool _isOperationInProgress; // Prevents overlapping dispwin.exe launches (e.g. rapid Alt+F1 presses)
         private Process? _activeDispwinProcess; // Track in-flight dispwin.exe so it can't be orphaned on exit
 
@@ -83,7 +106,9 @@ namespace SystemTrayApp
         
         // --- Notification Settings ---
         private bool _notificationsEnabled = true; // Default to enabled, loaded from registry
-        
+        private bool _hdrOnly = true;              // Only load the LUT on displays with HDR on
+        private bool _revertOnExit;                // Clear the LUT when the user exits the app
+
         // Monitor information structure
         public struct MonitorInfo
         {
@@ -98,11 +123,16 @@ namespace SystemTrayApp
 
             public string DisplayName;
 
-            public MonitorInfo(int displayNumber, string hardwareId, string displayName)
+            // GDI adapter name, e.g. "DISPLAY6" ("" if unknown). Volatile like DisplayNumber; used
+            // for in-process HDR and gamma ramp queries.
+            public string AdapterName;
+
+            public MonitorInfo(int displayNumber, string hardwareId, string displayName, string adapterName)
             {
                 DisplayNumber = displayNumber;
                 HardwareId = hardwareId;
                 DisplayName = displayName;
+                AdapterName = adapterName;
             }
         }
 
@@ -132,16 +162,22 @@ namespace SystemTrayApp
             InitializeNotificationTimer(); // Initialize the notification timer first
             InitializeProfileRecoveryTimer();
             InitializeSettingsWatchdogTimer();
+            InitializeFollowUpRecoveryTimer();
             _availableMonitors = DetectMonitors(); // Detect monitors
             LoadMonitorSelection(); // Load user's monitor preference
             LoadNotificationSetting(); // Load user's notification preference
+            _hdrOnly = ReadBoolSetting("HdrOnly", true);
+            _revertOnExit = ReadBoolSetting("RevertOnExit", false);
             LoadHotkeySettings(); // Load user's hotkey preference
+            RepairStartupPathIfMoved();
             InitializeComponent(); // Initialize UI elements
             RegisterHotkeys();     // Register hotkeys
             RegisterSystemEventHandlers();
 
-            // Apply the profile on startup (notification will be queued)
+            // Apply the profile on startup (notification will be queued). When launched at sign-in,
+            // Windows' Calibration Loader may overwrite it moments later, so check again shortly.
             _ = ApplySrgbToGammaAsync();
+            ScheduleFollowUpRecovery("Windows reloaded its default calibration after sign-in.");
         }
 
         private void InitializeComponent()
@@ -193,7 +229,31 @@ namespace SystemTrayApp
                 SaveNotificationSetting(notificationItem.Checked);
             };
             _contextMenu.Items.Add(notificationItem);
-            
+
+            // The LUT is tuned for HDR; loading it while a display is in SDR mode makes that
+            // display look wrong, so by default HDR-off displays are skipped (and restored).
+            var hdrOnlyItem = new ToolStripMenuItem("Only Apply When HDR Is On");
+            hdrOnlyItem.Checked = _hdrOnly;
+            hdrOnlyItem.Click += async (s, e) => {
+                hdrOnlyItem.Checked = !hdrOnlyItem.Checked;
+                _hdrOnly = hdrOnlyItem.Checked;
+                WriteBoolSetting("HdrOnly", _hdrOnly);
+                if (!_isDefaultProfile)
+                {
+                    await ApplySrgbToGammaAsync(); // Re-evaluate which displays get the LUT
+                }
+            };
+            _contextMenu.Items.Add(hdrOnlyItem);
+
+            var revertOnExitItem = new ToolStripMenuItem("Revert on Exit");
+            revertOnExitItem.Checked = _revertOnExit;
+            revertOnExitItem.Click += (s, e) => {
+                revertOnExitItem.Checked = !revertOnExitItem.Checked;
+                _revertOnExit = revertOnExitItem.Checked;
+                WriteBoolSetting("RevertOnExit", _revertOnExit);
+            };
+            _contextMenu.Items.Add(revertOnExitItem);
+
             // Add hotkey configuration option
             var hotkeyItem = new ToolStripMenuItem("Configure Hotkeys...");
             hotkeyItem.Click += OnConfigureHotkeys;
@@ -253,6 +313,15 @@ namespace SystemTrayApp
             _settingsWatchdogTimer.Tick += SettingsWatchdogTimer_Tick;
         }
 
+        private void InitializeFollowUpRecoveryTimer()
+        {
+            _followUpRecoveryTimer = new System.Windows.Forms.Timer
+            {
+                Interval = FollowUpRecoveryDelayMilliseconds
+            };
+            _followUpRecoveryTimer.Tick += FollowUpRecoveryTimer_Tick;
+        }
+
         // --- Timer Tick Event Handler ---
         private void NotificationTimer_Tick(object? sender, EventArgs e)
         {
@@ -291,18 +360,42 @@ namespace SystemTrayApp
 
         private void SettingsWatchdogTimer_Tick(object? sender, EventArgs e)
         {
-            bool isSystemSettingsRunning = IsSystemSettingsRunning();
-
-            if (_isDefaultProfile)
+            // Don't pile up requests while a reapply is pending or running: rescheduling would keep
+            // restarting the recovery delay every tick, so it would never fire.
+            if (_isDefaultProfile || _isOperationInProgress || _profileRecoveryTimer.Enabled
+                || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
-                _wasSystemSettingsRunning = isSystemSettingsRunning;
                 return;
             }
 
-            if (isSystemSettingsRunning && DateTime.UtcNow >= _ignoreProfileRecoveryEventsUntilUtc)
+            string? driftReason = DetectAppliedStateDrift();
+            if (driftReason != null)
             {
+                ScheduleProfileRecovery(driftReason, showNotification: false);
+                return;
+            }
+
+            if (CanVerifyAppliedGamma())
+            {
+                // The ramp check above sees resets from any source, so the Settings heuristic
+                // (and its repeated reapplies) isn't needed.
+                _wasSystemSettingsRunning = false;
+                return;
+            }
+
+            // Fallback when the loaded ramp can't be read back: assume Windows Settings may reset
+            // the gamma ramp while it's open, and reapply periodically for a limited time.
+            bool isSystemSettingsRunning = IsSystemSettingsRunning();
+            if (isSystemSettingsRunning)
+            {
+                if (!_wasSystemSettingsRunning)
+                {
+                    _systemSettingsFirstSeenUtc = DateTime.UtcNow;
+                }
+
                 bool shouldScheduleRecovery = !_wasSystemSettingsRunning
-                    || DateTime.UtcNow - _lastSettingsWatchdogRecoveryUtc >= SettingsWatchdogReapplyInterval;
+                    || (DateTime.UtcNow - _lastSettingsWatchdogRecoveryUtc >= SettingsWatchdogReapplyInterval
+                        && DateTime.UtcNow - _systemSettingsFirstSeenUtc < SettingsWatchdogMaxReapplyDuration);
 
                 if (shouldScheduleRecovery)
                 {
@@ -316,6 +409,84 @@ namespace SystemTrayApp
             }
 
             _wasSystemSettingsRunning = isSystemSettingsRunning;
+        }
+
+        /// <summary>
+        /// True if every monitor the LUT was applied to can be checked by reading its ramp back
+        /// (vacuously true when HDR is off everywhere and nothing was applied: then there is
+        /// nothing to protect, and the HDR check in the watchdog handles HDR being turned on).
+        /// </summary>
+        private bool CanVerifyAppliedGamma()
+        {
+            return _appliedMonitorStates.Count > 0
+                && _appliedMonitorStates.All(s => !s.GammaApplied || s.Ramp != null);
+        }
+
+        /// <summary>
+        /// Compares the live display state with what the last apply did. Returns a reason if the
+        /// profile needs to be reapplied (HDR switched on/off, or the loaded ramp was replaced),
+        /// otherwise null. Only uses cheap in-process queries, so it's safe to call every tick.
+        /// </summary>
+        private string? DetectAppliedStateDrift()
+        {
+            if (_appliedMonitorStates.Count == 0)
+            {
+                return null;
+            }
+
+            Dictionary<string, bool>? hdrByAdapter = _hdrOnly ? DisplayState.GetHdrStateByAdapter() : null;
+
+            foreach (var state in _appliedMonitorStates)
+            {
+                if (string.IsNullOrEmpty(state.AdapterName))
+                {
+                    continue;
+                }
+
+                if (hdrByAdapter != null && hdrByAdapter.TryGetValue(state.AdapterName, out bool isHdr)
+                    && isHdr != state.GammaApplied)
+                {
+                    return isHdr ? "HDR was turned on." : "HDR was turned off.";
+                }
+
+                if (state.GammaApplied && state.Ramp != null)
+                {
+                    ushort[]? current = DisplayState.ReadGammaRamp(state.AdapterName);
+                    if (current != null && !DisplayState.RampsEqual(current, state.Ramp))
+                    {
+                        return "Windows reset the gamma ramp.";
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private void FollowUpRecoveryTimer_Tick(object? sender, EventArgs e)
+        {
+            _followUpRecoveryTimer.Stop();
+            string reason = _pendingFollowUpRecoveryReason ?? "Windows may have reset the gamma ramp.";
+            _pendingFollowUpRecoveryReason = null;
+
+            // When the ramp can be verified, the watchdog already reapplies only if it was reset.
+            if (!_isDefaultProfile && !CanVerifyAppliedGamma())
+            {
+                ScheduleProfileRecovery(reason, showNotification: false);
+            }
+        }
+
+        /// <summary>
+        /// Schedules one more reapply check a few seconds from now, for events after which Windows
+        /// resets the gamma ramp with a delay (sign-in, unlock, resume).
+        /// </summary>
+        private void ScheduleFollowUpRecovery(string reason)
+        {
+            RunOnUiThread(() =>
+            {
+                _pendingFollowUpRecoveryReason = reason;
+                _followUpRecoveryTimer.Stop();
+                _followUpRecoveryTimer.Start();
+            });
         }
 
         // --- Queue Notification Method ---
@@ -369,6 +540,8 @@ namespace SystemTrayApp
             SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
             SystemEvents.SessionEnding += OnSessionEnding;
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.SessionSwitch += OnSessionSwitch;
         }
 
         private void UnregisterSystemEventHandlers()
@@ -376,6 +549,31 @@ namespace SystemTrayApp
             SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             SystemEvents.SessionEnding -= OnSessionEnding;
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+        }
+
+        private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+        {
+            // Graphics drivers often reset the gamma ramp when waking from sleep or hibernation.
+            if (e.Mode == PowerModes.Resume)
+            {
+                ScheduleProfileRecovery("Windows resumed from sleep.", showNotification: false);
+                ScheduleFollowUpRecovery("Windows resumed from sleep.");
+            }
+        }
+
+        private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
+        {
+            // Windows' Calibration Loader task reloads the default gamma ramp on console connect
+            // (e.g. returning from Remote Desktop or fast user switching), and unlocking can too.
+            if (e.Reason == SessionSwitchReason.SessionUnlock
+                || e.Reason == SessionSwitchReason.ConsoleConnect
+                || e.Reason == SessionSwitchReason.SessionLogon)
+            {
+                ScheduleProfileRecovery("Windows reloaded its default calibration.", showNotification: false);
+                ScheduleFollowUpRecovery("Windows reloaded its default calibration.");
+            }
         }
 
         private void OnSessionEnding(object? sender, SessionEndingEventArgs e)
@@ -388,6 +586,7 @@ namespace SystemTrayApp
             {
                 _profileRecoveryTimer.Stop();
                 _settingsWatchdogTimer.Stop();
+                _followUpRecoveryTimer.Stop();
                 _pendingProfileRecoveryReason = null;
                 _pendingProfileRecoveryNotification = false;
             });
@@ -420,7 +619,7 @@ namespace SystemTrayApp
 
         private void ScheduleProfileRecovery(string reason, bool showNotification = true)
         {
-            if (IsSessionEnding || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
+            if (IsShuttingDown || _isDefaultProfile || DateTime.UtcNow < _ignoreProfileRecoveryEventsUntilUtc)
             {
                 return;
             }
@@ -443,7 +642,12 @@ namespace SystemTrayApp
         {
             try
             {
-                return Process.GetProcessesByName("SystemSettings").Length > 0;
+                Process[] processes = Process.GetProcessesByName("SystemSettings");
+                foreach (var process in processes)
+                {
+                    process.Dispose();
+                }
+                return processes.Length > 0;
             }
             catch (Exception ex)
             {
@@ -531,7 +735,7 @@ namespace SystemTrayApp
             if (string.IsNullOrEmpty(dispwinPath))
             {
                 // Fallback: assume at least one monitor
-                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor"));
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor", ""));
                 return monitors;
             }
 
@@ -590,7 +794,7 @@ namespace SystemTrayApp
             // If no monitors detected, add primary as fallback
             if (monitors.Count == 0)
             {
-                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor"));
+                monitors.Add(new MonitorInfo(1, "PRIMARY", "Primary Monitor", ""));
             }
 
             return monitors;
@@ -674,7 +878,7 @@ namespace SystemTrayApp
                         displayName += " (Primary)";
                     }
 
-                    monitors.Add(new MonitorInfo(monitorNum, hardwareId, displayName));
+                    monitors.Add(new MonitorInfo(monitorNum, hardwareId, displayName, adapterName));
                 }
                 catch (Exception ex)
                 {
@@ -822,6 +1026,34 @@ namespace SystemTrayApp
             }
         }
         
+        private static bool ReadBoolSetting(string name, bool defaultValue)
+        {
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath, false);
+                return key?.GetValue(name) is int value ? value != 0 : defaultValue;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading setting {name}: {ex}");
+                return defaultValue;
+            }
+        }
+
+        private static void WriteBoolSetting(string name, bool value)
+        {
+            try
+            {
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath);
+                key?.SetValue(name, value ? 1 : 0);
+            }
+            catch (Exception ex)
+            {
+                // Ignore save errors
+                Debug.WriteLine($"Error saving setting {name}: {ex}");
+            }
+        }
+
         // --- Hotkey Configuration ---
         private void LoadHotkeySettings()
         {
@@ -1304,7 +1536,7 @@ namespace SystemTrayApp
 
         private async Task ApplySrgbToGammaAsync(bool showNotification = true, bool isAutomaticRecovery = false, string? recoveryReason = null)
         {
-            if (IsSessionEnding || _isOperationInProgress)
+            if (IsShuttingDown || _isOperationInProgress)
             {
                 return;
             }
@@ -1327,6 +1559,15 @@ namespace SystemTrayApp
                         {
                             QueueBalloonTip("Monitor Not Connected",
                                           $"{_selectedMonitorLastKnownName ?? "The selected monitor"} isn't connected right now. HDR Gamma Fix will apply the profile automatically once it reconnects.",
+                                          ToolTipIcon.Info);
+                        }
+                    }
+                    else if (result == ApplyResult.HdrOff)
+                    {
+                        if (showNotification)
+                        {
+                            QueueBalloonTip("HDR Is Off",
+                                          $"HDR is off{GetMonitorDisplayText()}, so the gamma fix isn't needed. It will apply automatically when HDR is turned on.",
                                           ToolTipIcon.Info);
                         }
                     }
@@ -1360,13 +1601,16 @@ namespace SystemTrayApp
             }
             finally
             {
+                // Detection plus one dispwin run per monitor can outlast the window opened at the
+                // start, so reopen it: events caused by our own apply must not trigger another one.
+                SuppressProfileRecoveryEvents();
                 _isOperationInProgress = false;
             }
         }
 
         private async Task RevertToDefaultAsync(bool showNotification = true)
         {
-            if (_isOperationInProgress)
+            if (_isExiting || _isOperationInProgress)
             {
                 return;
             }
@@ -1384,6 +1628,8 @@ namespace SystemTrayApp
                 if (result != ApplyResult.Failed)
                 {
                     _settingsWatchdogTimer.Stop(); // No need to watch settings while in default state
+                    _followUpRecoveryTimer.Stop();
+                    _appliedMonitorStates = new List<AppliedMonitorState>();
                     _isDefaultProfile = true;
                     UpdateIconAndText();
 
@@ -1414,6 +1660,7 @@ namespace SystemTrayApp
             }
             finally
             {
+                SuppressProfileRecoveryEvents();
                 _isOperationInProgress = false;
             }
         }
@@ -1428,6 +1675,7 @@ namespace SystemTrayApp
             Success,
             PartialSuccess,      // "All Monitors": at least one monitor was updated, but not all
             MonitorNotConnected, // Selected monitor is currently disconnected; nothing to do, not an error
+            HdrOff,              // Every targeted monitor is in SDR mode, so the LUT was not loaded; not an error
             Failed
         }
 
@@ -1440,44 +1688,141 @@ namespace SystemTrayApp
             var monitors = await Task.Run(DetectMonitors);
             RunOnUiThread(() => ApplyDetectedMonitors(monitors, showNotificationOnChange: false));
 
-            // If "All Monitors" is selected, apply to each currently connected monitor
+            // "All Monitors" targets every connected monitor. A specific monitor is only acted on
+            // if it's currently connected. If it isn't, this is not a failure - the selection is
+            // remembered and will be honored again once the monitor reconnects (see
+            // RefreshAvailableMonitors).
+            List<MonitorInfo> targets;
             if (_selectedMonitorKey == null)
             {
-                int succeeded = 0;
-                foreach (var monitor in monitors)
+                targets = monitors;
+            }
+            else
+            {
+                var monitorToUse = monitors.FirstOrDefault(m => m.HardwareId == _selectedMonitorKey);
+                if (monitorToUse.HardwareId == null)
+                {
+                    return ApplyResult.MonitorNotConnected;
+                }
+                targets = new List<MonitorInfo> { monitorToUse };
+            }
+
+            if (!fileName.Contains("srgb-to-gamma"))
+            {
+                int reverted = 0;
+                foreach (var monitor in targets)
                 {
                     if (await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber))
                     {
-                        succeeded++;
+                        reverted++;
                     }
                 }
+                return SummarizeResult(reverted, targets.Count);
+            }
 
-                if (succeeded == 0)
+            // HDR state per display; displays missing from the map (unknown) are treated as HDR,
+            // so a failed query falls back to applying the LUT as before.
+            Dictionary<string, bool> hdrByAdapter = _hdrOnly
+                ? DisplayState.GetHdrStateByAdapter()
+                : new Dictionary<string, bool>();
+
+            var previousStates = _appliedMonitorStates;
+            var newStates = new List<AppliedMonitorState>();
+            int attempted = 0, succeeded = 0;
+
+            foreach (var monitor in targets)
+            {
+                if (IsShuttingDown)
                 {
-                    return ApplyResult.Failed;
+                    break;
                 }
 
-                // Don't silently report failure when most monitors did work - that would leave the
-                // app thinking it's still in the default state and the next click would re-apply
-                // instead of reverting.
-                return succeeded == monitors.Count ? ApplyResult.Success : ApplyResult.PartialSuccess;
+                bool isHdr = !hdrByAdapter.TryGetValue(monitor.AdapterName, out bool hdr) || hdr;
+                if (!isHdr)
+                {
+                    // HDR is off: the HDR-tuned LUT would make this display look wrong. Only undo it
+                    // if we loaded it here earlier (e.g. HDR was just switched off) and it's still
+                    // loaded; otherwise leave the display's own calibration alone.
+                    var previous = previousStates.FirstOrDefault(s => s.HardwareId == monitor.HardwareId);
+                    if (previous != null && previous.GammaApplied && IsOurRampStillLoaded(previous, monitor.AdapterName))
+                    {
+                        await ExecuteBatchFileForMonitorAsync("revert.bat", monitor.DisplayNumber);
+                    }
+
+                    newStates.Add(new AppliedMonitorState
+                    {
+                        HardwareId = monitor.HardwareId,
+                        AdapterName = monitor.AdapterName,
+                        GammaApplied = false
+                    });
+                    continue;
+                }
+
+                attempted++;
+                bool ok = await ExecuteBatchFileForMonitorAsync(fileName, monitor.DisplayNumber);
+                if (ok)
+                {
+                    succeeded++;
+                }
+
+                // Remember the ramp that's loaded now, so the watchdog can tell when Windows
+                // replaces it. A read that looks like the default ramp means reads don't reflect
+                // what dispwin loaded on this system, so don't rely on them.
+                ushort[]? ramp = ok ? DisplayState.ReadGammaRamp(monitor.AdapterName) : null;
+                if (ramp != null && DisplayState.IsIdentityRamp(ramp))
+                {
+                    ramp = null;
+                }
+
+                newStates.Add(new AppliedMonitorState
+                {
+                    HardwareId = monitor.HardwareId,
+                    AdapterName = monitor.AdapterName,
+                    GammaApplied = true,
+                    Ramp = ramp
+                });
             }
 
-            // A specific monitor is selected: only act on it if it's currently connected. If it
-            // isn't, this is not a failure - the selection is remembered and will be honored again
-            // once the monitor reconnects (see RefreshAvailableMonitors).
-            var monitorToUse = monitors.FirstOrDefault(m => m.HardwareId == _selectedMonitorKey);
-            if (monitorToUse.HardwareId == null)
+            _appliedMonitorStates = newStates;
+
+            if (attempted == 0 && newStates.Count > 0)
             {
-                return ApplyResult.MonitorNotConnected;
+                return ApplyResult.HdrOff;
+            }
+            return SummarizeResult(succeeded, attempted);
+        }
+
+        private static ApplyResult SummarizeResult(int succeeded, int attempted)
+        {
+            if (succeeded == 0)
+            {
+                return ApplyResult.Failed;
             }
 
-            bool ok = await ExecuteBatchFileForMonitorAsync(fileName, monitorToUse.DisplayNumber);
-            return ok ? ApplyResult.Success : ApplyResult.Failed;
+            // Don't silently report failure when most monitors did work - that would leave the app
+            // thinking it's still in the default state and the next click would re-apply instead
+            // of reverting.
+            return succeeded == attempted ? ApplyResult.Success : ApplyResult.PartialSuccess;
+        }
+
+        private static bool IsOurRampStillLoaded(AppliedMonitorState state, string adapterName)
+        {
+            if (state.Ramp == null)
+            {
+                return true; // Can't tell, so assume it is
+            }
+
+            ushort[]? current = DisplayState.ReadGammaRamp(adapterName);
+            return current == null || DisplayState.RampsEqual(current, state.Ramp);
         }
         
         private async Task<bool> ExecuteBatchFileForMonitorAsync(string fileName, int monitorIndex)
         {
+            if (IsShuttingDown)
+            {
+                return false; // Never start dispwin.exe once the app or Windows is closing
+            }
+
             try
             {
                 // Find dispwin.exe path
@@ -1591,12 +1936,23 @@ namespace SystemTrayApp
 
         private void OnExit(object? sender, EventArgs e)
         {
+            // Block further dispwin.exe launches first: an "All Monitors" apply that is mid-loop
+            // would otherwise start the next monitor's run after we've waited for the current one.
+            _isExiting = true;
+
+            _profileRecoveryTimer?.Stop();
+            _settingsWatchdogTimer?.Stop();
+            _followUpRecoveryTimer?.Stop();
+
             // Wait for any in-flight dispwin.exe to finish (or kill it) so it isn't
             // orphaned and doesn't apply/change the gamma after the app has exited.
             WaitForActiveDispwinToFinish();
 
-            _profileRecoveryTimer?.Stop();
-            _settingsWatchdogTimer?.Stop();
+            if (_revertOnExit && !_isDefaultProfile)
+            {
+                RevertTargetMonitorsForExit();
+            }
+
             UnregisterSystemEventHandlers();
 
             if (_notifyIcon != null)
@@ -1637,6 +1993,53 @@ namespace SystemTrayApp
             }
         }
 
+        /// <summary>
+        /// Clears the LUT from the monitors the profile targets, synchronously, as the app exits.
+        /// Each dispwin run is bounded, so a hung helper can't keep the app from closing.
+        /// </summary>
+        private void RevertTargetMonitorsForExit()
+        {
+            string dispwinPath = FindDispwinExecutable();
+            if (string.IsNullOrEmpty(dispwinPath))
+            {
+                return;
+            }
+
+            string workingDirectory = Path.GetDirectoryName(dispwinPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+
+            // Fresh detection, for the same reason as ExecuteBatchFileAsync: cached indices may be stale.
+            var monitors = DetectMonitors();
+            var targets = _selectedMonitorKey == null
+                ? monitors
+                : monitors.Where(m => m.HardwareId == _selectedMonitorKey).ToList();
+
+            foreach (var monitor in targets)
+            {
+                try
+                {
+                    using Process? process = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = dispwinPath,
+                        Arguments = $"-d {monitor.DisplayNumber} -c",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        WorkingDirectory = workingDirectory
+                    });
+
+                    if (process != null && !process.WaitForExit(5000))
+                    {
+                        Debug.WriteLine("dispwin.exe -c did not finish in time during app exit; terminating it.");
+                        process.Kill();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error reverting monitor {monitor.DisplayNumber} on exit: {ex}");
+                }
+            }
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -1645,9 +2048,11 @@ namespace SystemTrayApp
                 _notificationTimer?.Stop(); // Stop the timer before disposing
                 _profileRecoveryTimer?.Stop();
                 _settingsWatchdogTimer?.Stop();
+                _followUpRecoveryTimer?.Stop();
                 _notificationTimer?.Dispose();
                 _profileRecoveryTimer?.Dispose();
                 _settingsWatchdogTimer?.Dispose();
+                _followUpRecoveryTimer?.Dispose();
                 _defaultIcon?.Dispose();
                 _gammaIcon?.Dispose();
                 _notifyIcon?.Dispose();
@@ -1701,6 +2106,35 @@ namespace SystemTrayApp
             {
                  QueueBalloonTip("Registry Error", $"Failed to update startup setting: {ex.Message}", ToolTipIcon.Error);
                  Debug.WriteLine($"Registry Error: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// If "Run at Startup" points at an exe that no longer exists (the app was moved, or a new
+        /// release was extracted elsewhere and the old folder deleted), repoint it at this exe.
+        /// A startup entry whose exe still exists is left alone, so running another copy (e.g. a
+        /// development build) doesn't hijack it.
+        /// </summary>
+        private static void RepairStartupPathIfMoved()
+        {
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
+                if (key?.GetValue(AppRegistryName) is not string registered)
+                {
+                    return;
+                }
+
+                string registeredPath = registered.Trim().Trim('"');
+                if (!File.Exists(registeredPath))
+                {
+                    key.SetValue(AppRegistryName, $"\"{Application.ExecutablePath}\"");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error repairing startup registry entry: {ex.Message}");
             }
         }
 
