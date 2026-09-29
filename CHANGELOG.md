@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - "Revert on Exit" option (off by default) that clears the LUT when the app is closed.
 
 ### Changed
+- Redesigned tray icons, drawn at the exact tray size so they stay sharp at any scaling. The "off"
+  icon follows the taskbar theme (the old black one was nearly invisible on a dark taskbar), and a
+  new "paused" icon shows when the fix is on but nothing is loaded (HDR off, or the selected
+  monitor disconnected).
+- README rewritten: tray icon states, menu reference, gamma curve settings, troubleshooting and
+  uninstall steps.
 - The watchdog now reads the loaded gamma ramp back and reapplies only when Windows actually
   replaced it, whatever the cause. Previously it guessed from whether Windows Settings was
   running and reapplied every 4 seconds for as long as `SystemSettings.exe` existed, which on
